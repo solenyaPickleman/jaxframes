@@ -3,7 +3,7 @@
 ## Prerequisites
 
 ### System Requirements
-- Python 3.10 or later (tested with 3.12)
+- Python 3.10 or later (minimum 3.10, tested with 3.10-3.12)
 - Operating System: Linux, macOS, or Windows (with WSL2)
 - Optional: CUDA-capable GPU or Google Cloud TPU for accelerated computing
 
@@ -300,7 +300,7 @@ export JAX_ENABLE_X64=True  # Enable 64-bit precision
 
 ```dockerfile
 # Dockerfile
-FROM python:3.12-slim
+FROM python:3.10-slim
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y \

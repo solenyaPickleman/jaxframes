@@ -1,0 +1,7 @@
+# UV Configuration for JaxFrames
+
+# Use system Python if available, otherwise manage Python
+python-preference = "managed"
+
+# Development dependencies (these go in pyproject.toml instead)
+# This file primarily controls UV's Python selection behavior
