@@ -21,6 +21,9 @@ from .operations import (
 from .padding import (
     PaddingInfo, calculate_padded_size, pad_array, unpad_array
 )
+from .parallel_algorithms import (
+    parallel_sort, groupby_aggregate, sort_merge_join
+)
 
 
 class DistributedJaxFrame(JaxFrame):
@@ -547,6 +550,253 @@ class DistributedJaxFrame(JaxFrame):
             sharding_info = f"Sharding: row={self.sharding.row_sharding}, col={self.sharding.col_sharding}"
             return f"{base_repr}\n[Distributed: {mesh_info}, {sharding_info}]"
         return base_repr
+    
+    def sort_values(self, by: Union[str, List[str]], ascending: bool = True) -> 'DistributedJaxFrame':
+        """
+        Sort DataFrame by specified column(s) using parallel radix sort.
+        
+        Parameters
+        ----------
+        by : str or List[str]
+            Column name(s) to sort by
+        ascending : bool
+            Sort order (default True for ascending)
+            
+        Returns
+        -------
+        DistributedJaxFrame
+            New sorted DataFrame
+        """
+        # Handle single column name
+        if isinstance(by, str):
+            by = [by]
+        
+        # For now, support single column sorting
+        if len(by) > 1:
+            raise NotImplementedError("Multi-column sorting not yet implemented")
+        
+        sort_col = by[0]
+        if sort_col not in self.columns:
+            raise KeyError(f"Column '{sort_col}' not found")
+        
+        # Get the sort column data
+        keys = self.data[sort_col]
+        
+        # Check if column is numeric
+        if self._dtypes[sort_col] == 'object':
+            raise TypeError("Cannot sort object dtype columns with parallel sort")
+        
+        # Create array of row indices to track reordering
+        row_indices = jnp.arange(len(keys))
+        
+        # Perform parallel sort
+        sorted_keys, sorted_indices = parallel_sort(
+            keys, 
+            sharding_spec=self.sharding,
+            values=row_indices,
+            ascending=ascending
+        )
+        
+        # Reorder all columns based on sorted indices
+        result_data = {}
+        for col in self.columns:
+            if self._dtypes[col] != 'object':
+                # Reorder JAX arrays
+                result_data[col] = self.data[col][sorted_indices]
+            else:
+                # Reorder object arrays
+                # Need to gather, reorder, and reshard for object types
+                gathered = distributed_gather(self.data[col], self.sharding) if self.sharding else self.data[col]
+                reordered = gathered[sorted_indices]
+                result_data[col] = reordered
+        
+        return DistributedJaxFrame(result_data, index=None, sharding=self.sharding)
+    
+    def groupby(self, by: Union[str, List[str]]) -> 'GroupBy':
+        """
+        Group DataFrame by specified column(s).
+        
+        Parameters
+        ----------
+        by : str or List[str]
+            Column name(s) to group by
+            
+        Returns
+        -------
+        GroupBy
+            GroupBy object for aggregation
+        """
+        return GroupBy(self, by)
+    
+    def merge(
+        self,
+        other: 'DistributedJaxFrame',
+        on: Union[str, List[str]],
+        how: str = 'inner'
+    ) -> 'DistributedJaxFrame':
+        """
+        Merge with another DataFrame using parallel sort-merge join.
+        
+        Parameters
+        ----------
+        other : DistributedJaxFrame
+            DataFrame to join with
+        on : str or List[str]
+            Column name(s) to join on
+        how : str
+            Join type ('inner', 'left', 'right', 'outer')
+            
+        Returns
+        -------
+        DistributedJaxFrame
+            Merged DataFrame
+        """
+        # Handle single column name
+        if isinstance(on, str):
+            on = [on]
+        
+        # For now, support single column joins
+        if len(on) > 1:
+            raise NotImplementedError("Multi-column joins not yet implemented")
+        
+        join_col = on[0]
+        
+        # Validate join columns exist
+        if join_col not in self.columns:
+            raise KeyError(f"Column '{join_col}' not found in left DataFrame")
+        if join_col not in other.columns:
+            raise KeyError(f"Column '{join_col}' not found in right DataFrame")
+        
+        # Check if join columns are numeric
+        if self._dtypes[join_col] == 'object' or other._dtypes[join_col] == 'object':
+            raise TypeError("Cannot join on object dtype columns with parallel join")
+        
+        # Prepare join keys and values
+        left_keys = self.data[join_col]
+        right_keys = other.data[join_col]
+        
+        # Prepare value dictionaries (excluding join key)
+        left_values = {col: self.data[col] for col in self.columns if col != join_col}
+        right_values = {col: other.data[col] for col in other.columns if col != join_col}
+        
+        # Perform parallel sort-merge join
+        joined_keys, joined_values = sort_merge_join(
+            left_keys, left_values,
+            right_keys, right_values,
+            how=how,
+            sharding_spec=self.sharding
+        )
+        
+        # Combine keys and values into result
+        result_data = {join_col: joined_keys}
+        result_data.update(joined_values)
+        
+        return DistributedJaxFrame(result_data, index=None, sharding=self.sharding)
+
+
+class GroupBy:
+    """
+    GroupBy object for distributed aggregations.
+    
+    This class provides aggregation methods that use the parallel
+    sort-based groupby algorithm.
+    """
+    
+    def __init__(self, frame: DistributedJaxFrame, by: Union[str, List[str]]):
+        """
+        Initialize GroupBy object.
+        
+        Parameters
+        ----------
+        frame : DistributedJaxFrame
+            DataFrame to group
+        by : str or List[str]
+            Column name(s) to group by
+        """
+        self.frame = frame
+        self.by = [by] if isinstance(by, str) else by
+        
+        # For now, only support single column groupby
+        if len(self.by) > 1:
+            raise NotImplementedError("Multi-column groupby not yet implemented")
+    
+    def agg(self, agg_funcs: Union[str, Dict[str, str]]) -> DistributedJaxFrame:
+        """
+        Perform aggregation on grouped data.
+        
+        Parameters
+        ----------
+        agg_funcs : str or Dict[str, str]
+            Aggregation function(s) to apply.
+            If string, applies same function to all numeric columns.
+            If dict, maps column names to aggregation functions.
+            
+        Returns
+        -------
+        DistributedJaxFrame
+            Aggregated results
+        """
+        group_col = self.by[0]
+        
+        # Check if group column is numeric
+        if self.frame._dtypes[group_col] == 'object':
+            raise TypeError("Cannot group by object dtype columns")
+        
+        # Prepare aggregation functions
+        if isinstance(agg_funcs, str):
+            # Apply same function to all numeric columns (except group column)
+            agg_dict = {}
+            for col in self.frame.columns:
+                if col != group_col and self.frame._dtypes[col] != 'object':
+                    agg_dict[col] = agg_funcs
+        else:
+            agg_dict = agg_funcs
+        
+        # Validate aggregation functions
+        valid_aggs = {'sum', 'mean', 'max', 'min', 'count'}
+        for col, func in agg_dict.items():
+            if func not in valid_aggs:
+                raise ValueError(f"Unsupported aggregation function: {func}")
+            if col not in self.frame.columns:
+                raise KeyError(f"Column '{col}' not found")
+            if self.frame._dtypes[col] == 'object':
+                raise TypeError(f"Cannot aggregate object dtype column '{col}'")
+        
+        # Prepare keys and values for aggregation
+        keys = self.frame.data[group_col]
+        values = {col: self.frame.data[col] for col in agg_dict.keys()}
+        
+        # Perform sort-based groupby aggregation
+        unique_keys, aggregated = groupby_aggregate(
+            keys, values, agg_dict,
+            sharding_spec=self.frame.sharding
+        )
+        
+        # Create result DataFrame
+        result_data = {group_col: unique_keys}
+        result_data.update(aggregated)
+        
+        return DistributedJaxFrame(result_data, index=None, sharding=self.frame.sharding)
+    
+    def sum(self) -> DistributedJaxFrame:
+        """Sum aggregation for grouped data."""
+        return self.agg('sum')
+    
+    def mean(self) -> DistributedJaxFrame:
+        """Mean aggregation for grouped data."""
+        return self.agg('mean')
+    
+    def max(self) -> DistributedJaxFrame:
+        """Max aggregation for grouped data."""
+        return self.agg('max')
+    
+    def min(self) -> DistributedJaxFrame:
+        """Min aggregation for grouped data."""
+        return self.agg('min')
+    
+    def count(self) -> DistributedJaxFrame:
+        """Count aggregation for grouped data."""
+        return self.agg('count')
 
 
 # Register DistributedJaxFrame as a PyTree

@@ -291,6 +291,325 @@ class JaxFrame:
     def __repr__(self) -> str:
         """Return string representation."""
         return f"JaxFrame(shape={self.shape}, columns={self.columns})"
+    
+    def __add__(self, other):
+        """Addition operation."""
+        result_data = {}
+        
+        if isinstance(other, (int, float, np.number)):
+            # Scalar addition
+            for col in self.columns:
+                if self._dtypes[col] != 'object':
+                    result_data[col] = self.data[col] + other
+                else:
+                    result_data[col] = self.data[col]
+        elif isinstance(other, JaxFrame):
+            # DataFrame addition
+            for col in self.columns:
+                if col in other.columns and self._dtypes[col] != 'object':
+                    result_data[col] = self.data[col] + other.data[col]
+                else:
+                    result_data[col] = self.data[col]
+        else:
+            return NotImplemented
+            
+        return JaxFrame(result_data, index=self.index)
+    
+    def __sub__(self, other):
+        """Subtraction operation."""
+        result_data = {}
+        
+        if isinstance(other, (int, float, np.number)):
+            # Scalar subtraction
+            for col in self.columns:
+                if self._dtypes[col] != 'object':
+                    result_data[col] = self.data[col] - other
+                else:
+                    result_data[col] = self.data[col]
+        elif isinstance(other, JaxFrame):
+            # DataFrame subtraction
+            for col in self.columns:
+                if col in other.columns and self._dtypes[col] != 'object':
+                    result_data[col] = self.data[col] - other.data[col]
+                else:
+                    result_data[col] = self.data[col]
+        else:
+            return NotImplemented
+            
+        return JaxFrame(result_data, index=self.index)
+    
+    def __mul__(self, other):
+        """Multiplication operation."""
+        result_data = {}
+        
+        if isinstance(other, (int, float, np.number)):
+            # Scalar multiplication
+            for col in self.columns:
+                if self._dtypes[col] != 'object':
+                    result_data[col] = self.data[col] * other
+                else:
+                    result_data[col] = self.data[col]
+        elif isinstance(other, JaxFrame):
+            # DataFrame multiplication
+            for col in self.columns:
+                if col in other.columns and self._dtypes[col] != 'object':
+                    result_data[col] = self.data[col] * other.data[col]
+                else:
+                    result_data[col] = self.data[col]
+        else:
+            return NotImplemented
+            
+        return JaxFrame(result_data, index=self.index)
+    
+    def __truediv__(self, other):
+        """Division operation."""
+        result_data = {}
+        
+        if isinstance(other, (int, float, np.number)):
+            # Scalar division
+            for col in self.columns:
+                if self._dtypes[col] != 'object':
+                    result_data[col] = self.data[col] / other
+                else:
+                    result_data[col] = self.data[col]
+        elif isinstance(other, JaxFrame):
+            # DataFrame division
+            for col in self.columns:
+                if col in other.columns and self._dtypes[col] != 'object':
+                    result_data[col] = self.data[col] / other.data[col]
+                else:
+                    result_data[col] = self.data[col]
+        else:
+            return NotImplemented
+            
+        return JaxFrame(result_data, index=self.index)
+    
+    def __radd__(self, other):
+        """Right addition."""
+        return self.__add__(other)
+    
+    def __rsub__(self, other):
+        """Right subtraction."""
+        result_data = {}
+        if isinstance(other, (int, float, np.number)):
+            for col in self.columns:
+                if self._dtypes[col] != 'object':
+                    result_data[col] = other - self.data[col]
+                else:
+                    result_data[col] = self.data[col]
+            return JaxFrame(result_data, index=self.index)
+        return NotImplemented
+    
+    def __rmul__(self, other):
+        """Right multiplication."""
+        return self.__mul__(other)
+    
+    def __rtruediv__(self, other):
+        """Right division."""
+        result_data = {}
+        if isinstance(other, (int, float, np.number)):
+            for col in self.columns:
+                if self._dtypes[col] != 'object':
+                    result_data[col] = other / self.data[col]
+                else:
+                    result_data[col] = self.data[col]
+            return JaxFrame(result_data, index=self.index)
+        return NotImplemented
+    
+    def sort_values(self, by: Union[str, List[str]], ascending: bool = True) -> 'JaxFrame':
+        """
+        Sort DataFrame by specified column(s).
+        
+        Parameters
+        ----------
+        by : str or List[str]
+            Column name(s) to sort by
+        ascending : bool
+            Sort order (default True for ascending)
+            
+        Returns
+        -------
+        JaxFrame
+            New sorted DataFrame
+        """
+        # Import here to avoid circular dependency
+        from ..distributed.parallel_algorithms import parallel_sort
+        
+        # Handle single column name
+        if isinstance(by, str):
+            by = [by]
+        
+        # For now, support single column sorting
+        if len(by) > 1:
+            raise NotImplementedError("Multi-column sorting not yet implemented")
+        
+        sort_col = by[0]
+        if sort_col not in self.columns:
+            raise KeyError(f"Column '{sort_col}' not found")
+        
+        # Get the sort column data
+        keys = self.data[sort_col]
+        
+        # Check if column is numeric
+        if self._dtypes[sort_col] == 'object':
+            raise TypeError("Cannot sort object dtype columns with parallel sort")
+        
+        # Create array of row indices to track reordering
+        row_indices = jnp.arange(len(keys))
+        
+        # Perform parallel sort
+        sorted_keys, sorted_indices = parallel_sort(
+            keys, 
+            values=row_indices,
+            ascending=ascending
+        )
+        
+        # Reorder all columns based on sorted indices
+        result_data = {}
+        for col in self.columns:
+            if self._dtypes[col] != 'object':
+                # Reorder JAX arrays
+                result_data[col] = self.data[col][sorted_indices]
+            else:
+                # Reorder object arrays
+                result_data[col] = self.data[col][sorted_indices]
+        
+        return JaxFrame(result_data, index=None)
+    
+    def groupby(self, by: Union[str, List[str]]) -> 'GroupBy':
+        """
+        Group DataFrame by specified column(s).
+        
+        Parameters
+        ----------
+        by : str or List[str]
+            Column name(s) to group by
+            
+        Returns
+        -------
+        GroupBy
+            GroupBy object for aggregation
+        """
+        # Import here to avoid circular dependency
+        from ..distributed.frame import GroupBy as DistGroupBy
+        
+        # Use a simple wrapper that works for both distributed and non-distributed
+        class GroupBy:
+            def __init__(self, frame, by):
+                self.frame = frame
+                self.by = [by] if isinstance(by, str) else by
+                if len(self.by) > 1:
+                    raise NotImplementedError("Multi-column groupby not yet implemented")
+            
+            def agg(self, agg_funcs):
+                from ..distributed.parallel_algorithms import groupby_aggregate
+                
+                group_col = self.by[0]
+                if self.frame._dtypes[group_col] == 'object':
+                    raise TypeError("Cannot group by object dtype columns")
+                
+                # Prepare aggregation functions
+                if isinstance(agg_funcs, str):
+                    agg_dict = {}
+                    for col in self.frame.columns:
+                        if col != group_col and self.frame._dtypes[col] != 'object':
+                            agg_dict[col] = agg_funcs
+                else:
+                    agg_dict = agg_funcs
+                
+                # Validate and perform aggregation
+                keys = self.frame.data[group_col]
+                values = {col: self.frame.data[col] for col in agg_dict.keys()}
+                
+                unique_keys, aggregated = groupby_aggregate(keys, values, agg_dict)
+                
+                result_data = {group_col: unique_keys}
+                result_data.update(aggregated)
+                
+                return JaxFrame(result_data, index=None)
+            
+            def sum(self):
+                return self.agg('sum')
+            
+            def mean(self):
+                return self.agg('mean')
+            
+            def max(self):
+                return self.agg('max')
+            
+            def min(self):
+                return self.agg('min')
+            
+            def count(self):
+                return self.agg('count')
+        
+        return GroupBy(self, by)
+    
+    def merge(
+        self,
+        other: 'JaxFrame',
+        on: Union[str, List[str]],
+        how: str = 'inner'
+    ) -> 'JaxFrame':
+        """
+        Merge with another DataFrame.
+        
+        Parameters
+        ----------
+        other : JaxFrame
+            DataFrame to join with
+        on : str or List[str]
+            Column name(s) to join on
+        how : str
+            Join type ('inner', 'left', 'right', 'outer')
+            
+        Returns
+        -------
+        JaxFrame
+            Merged DataFrame
+        """
+        from ..distributed.parallel_algorithms import sort_merge_join
+        
+        # Handle single column name
+        if isinstance(on, str):
+            on = [on]
+        
+        # For now, support single column joins
+        if len(on) > 1:
+            raise NotImplementedError("Multi-column joins not yet implemented")
+        
+        join_col = on[0]
+        
+        # Validate join columns exist
+        if join_col not in self.columns:
+            raise KeyError(f"Column '{join_col}' not found in left DataFrame")
+        if join_col not in other.columns:
+            raise KeyError(f"Column '{join_col}' not found in right DataFrame")
+        
+        # Check if join columns are numeric
+        if self._dtypes[join_col] == 'object' or other._dtypes[join_col] == 'object':
+            raise TypeError("Cannot join on object dtype columns with parallel join")
+        
+        # Prepare join keys and values
+        left_keys = self.data[join_col]
+        right_keys = other.data[join_col]
+        
+        # Prepare value dictionaries (excluding join key)
+        left_values = {col: self.data[col] for col in self.columns if col != join_col}
+        right_values = {col: other.data[col] for col in other.columns if col != join_col}
+        
+        # Perform parallel sort-merge join
+        joined_keys, joined_values = sort_merge_join(
+            left_keys, left_values,
+            right_keys, right_values,
+            how=how
+        )
+        
+        # Combine keys and values into result
+        result_data = {join_col: joined_keys}
+        result_data.update(joined_values)
+        
+        return JaxFrame(result_data, index=None)
 
 
 # PyTree registration for JAX compatibility
