@@ -329,7 +329,7 @@ class TestMultiDeviceAlgorithms:
         """Test sorting with distributed data."""
         # Create mesh for distribution
         devices = jax.devices()[:2]  # Use first 2 devices
-        mesh = Mesh(devices, axis_names=('devices',))
+        mesh = Mesh(devices, axis_names=('data',))
         sharding_spec = row_sharded(mesh)
         
         # Create distributed DataFrame
@@ -351,7 +351,7 @@ class TestMultiDeviceAlgorithms:
         """Test groupby with distributed data."""
         # Create mesh
         devices = jax.devices()[:2]
-        mesh = Mesh(devices, axis_names=('devices',))
+        mesh = Mesh(devices, axis_names=('data',))
         sharding_spec = row_sharded(mesh)
         
         # Create data with known groups

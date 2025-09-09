@@ -268,6 +268,7 @@ class TestDistributedOperations:
     def test_distributed_gather(self):
         """Test gathering sharded arrays."""
         from jaxframes.distributed.operations import distributed_gather
+        from jaxframes.distributed.padding import unpad_array
         
         mesh = create_device_mesh()
         sharding = row_sharded(mesh)
@@ -279,7 +280,10 @@ class TestDistributedOperations:
         
         # Gather it
         gathered = distributed_gather(sharded, sharding)
-        np.testing.assert_array_equal(np.array(gathered), np.arange(10))
+        
+        # Remove padding - the array was padded to be divisible by device count
+        unpadded = unpad_array(gathered, original_size=10, axis=0)
+        np.testing.assert_array_equal(np.array(unpadded), np.arange(10))
     
     def test_elementwise_ops_preserve_sharding(self):
         """Test that element-wise operations preserve sharding."""

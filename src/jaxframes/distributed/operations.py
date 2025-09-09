@@ -63,18 +63,40 @@ def distributed_reduction(
     # For now, gather and reduce locally
     gathered = distributed_gather(array, sharding_spec)
     
-    if op == 'sum':
-        return jnp.sum(gathered, axis=axis, keepdims=keepdims)
-    elif op == 'mean':
-        return jnp.mean(gathered, axis=axis, keepdims=keepdims)
-    elif op == 'max':
-        return jnp.max(gathered, axis=axis, keepdims=keepdims)
-    elif op == 'min':
-        return jnp.min(gathered, axis=axis, keepdims=keepdims)
-    elif op == 'prod':
-        return jnp.prod(gathered, axis=axis, keepdims=keepdims)
+    # Use nan-safe operations for floating point types to handle padding
+    if jnp.issubdtype(gathered.dtype, jnp.floating):
+        if op == 'sum':
+            return jnp.nansum(gathered, axis=axis, keepdims=keepdims)
+        elif op == 'mean':
+            return jnp.nanmean(gathered, axis=axis, keepdims=keepdims)
+        elif op == 'max':
+            return jnp.nanmax(gathered, axis=axis, keepdims=keepdims)
+        elif op == 'min':
+            return jnp.nanmin(gathered, axis=axis, keepdims=keepdims)
+        elif op == 'prod':
+            return jnp.nanprod(gathered, axis=axis, keepdims=keepdims)
+        else:
+            raise ValueError(f"Unsupported reduction operation: {op}")
     else:
-        raise ValueError(f"Unsupported reduction operation: {op}")
+        # For integer types, we need to mask out the padding value (-999999)
+        if op == 'sum':
+            mask = gathered != -999999
+            return jnp.sum(jnp.where(mask, gathered, 0), axis=axis, keepdims=keepdims)
+        elif op == 'mean':
+            mask = gathered != -999999
+            valid_count = jnp.sum(mask, axis=axis, keepdims=keepdims)
+            return jnp.sum(jnp.where(mask, gathered, 0), axis=axis, keepdims=keepdims) / jnp.maximum(valid_count, 1)
+        elif op == 'max':
+            mask = gathered != -999999
+            return jnp.max(jnp.where(mask, gathered, jnp.iinfo(gathered.dtype).min), axis=axis, keepdims=keepdims)
+        elif op == 'min':
+            mask = gathered != -999999
+            return jnp.min(jnp.where(mask, gathered, jnp.iinfo(gathered.dtype).max), axis=axis, keepdims=keepdims)
+        elif op == 'prod':
+            mask = gathered != -999999
+            return jnp.prod(jnp.where(mask, gathered, 1), axis=axis, keepdims=keepdims)
+        else:
+            raise ValueError(f"Unsupported reduction operation: {op}")
 
 
 def distributed_broadcast(
@@ -115,9 +137,10 @@ def distributed_gather(
         # Already replicated
         return array
     
-    # For gathering, we can just return the array as JAX will handle it
-    # when accessing the data
-    return array
+    # Gather the array by replicating it across all devices
+    # This effectively materializes the full array on each device
+    replicated_sharding = NamedSharding(sharding_spec.mesh, P())
+    return jax.lax.with_sharding_constraint(array, replicated_sharding)
 
 
 def distributed_concatenate(
