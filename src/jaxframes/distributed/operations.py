@@ -30,7 +30,7 @@ def distributed_elementwise_op(
     # Only apply sharding if we have multiple devices
     if sharding_spec.mesh.size > 1:
         # Check if result needs padding for sharding
-        from .sharding import calculate_padded_size, pad_array
+        from .padding import calculate_padded_size, pad_array
         
         num_devices = sharding_spec.mesh.size
         original_size = result.shape[0] if result.ndim > 0 else 1

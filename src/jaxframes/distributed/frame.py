@@ -110,6 +110,18 @@ class DistributedJaxFrame(JaxFrame):
                 # Only shard JAX-compatible arrays
                 self.data[col_name] = shard_array(arr, self.sharding)
     
+    @property
+    def shape(self):
+        """Return the original shape of the DataFrame (without padding)."""
+        if self.padding_info and self.columns:
+            # Get the original shape from the first column
+            first_col = self.columns[0]
+            original_size = self.padding_info.get_original_size(first_col, axis=0)
+            if original_size is not None:
+                return (original_size, len(self.columns))
+        # Fall back to parent implementation
+        return super().shape
+    
     @classmethod
     def from_arrays(
         cls,
