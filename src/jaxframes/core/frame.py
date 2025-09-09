@@ -433,7 +433,8 @@ class JaxFrame:
             New sorted DataFrame
         """
         # Import here to avoid circular dependency
-        from ..distributed.parallel_algorithms import parallel_sort
+        # Use fast JIT-compiled version for better performance
+        from ..distributed.fast_algorithms import parallel_sort
         
         # Handle single column name
         if isinstance(by, str):
@@ -502,7 +503,7 @@ class JaxFrame:
                     raise NotImplementedError("Multi-column groupby not yet implemented")
             
             def agg(self, agg_funcs):
-                from ..distributed.parallel_algorithms import groupby_aggregate
+                from ..distributed.fast_algorithms import groupby_aggregate
                 
                 group_col = self.by[0]
                 if self.frame._dtypes[group_col] == 'object':

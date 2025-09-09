@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 import jax
 import jax.numpy as jnp
-from jaxframes.core import JaxFrame
+from jaxframes.core import JaxFrame, JaxSeries
 
 # Force JAX to pre-compile and initialize
 print("Initializing JAX...")
@@ -48,10 +48,14 @@ def benchmark_operation(name, jax_fn, pandas_fn, warmup=True):
         # Force computation to complete
         if hasattr(jax_result, 'block_until_ready'):
             jax_result.block_until_ready()
-        elif hasattr(jax_result, 'data'):
-            for col in jax_result.data.values():
-                if hasattr(col, 'block_until_ready'):
-                    col.block_until_ready()
+        elif isinstance(jax_result, (JaxFrame, JaxSeries)):
+            if hasattr(jax_result, 'data'):
+                if isinstance(jax_result.data, dict):
+                    for col in jax_result.data.values():
+                        if hasattr(col, 'block_until_ready'):
+                            col.block_until_ready()
+                elif hasattr(jax_result.data, 'block_until_ready'):
+                    jax_result.data.block_until_ready()
         jax_times.append(time.perf_counter() - start)
     
     # Benchmark pandas
