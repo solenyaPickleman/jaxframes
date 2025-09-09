@@ -122,6 +122,36 @@ class DistributedJaxFrame(JaxFrame):
         # Fall back to parent implementation
         return super().shape
     
+    def _create_result_frame(
+        self,
+        data: Dict[str, Union[Array, np.ndarray]],
+        index: Optional[Any] = None,
+        sharding: Optional[ShardingSpec] = None
+    ) -> 'DistributedJaxFrame':
+        """
+        Create a result frame from operations, preserving padding info.
+        
+        This method assumes the data is already properly padded and sharded.
+        """
+        # Create new frame without re-padding
+        result = DistributedJaxFrame.__new__(DistributedJaxFrame)
+        result.sharding = sharding or self.sharding
+        result.padding_info = PaddingInfo(result.sharding.mesh.size if result.sharding else 1)
+        
+        # Copy padding info from source
+        for col_name in data.keys():
+            if col_name in self.padding_info.original_shapes:
+                result.padding_info.add_column(
+                    col_name,
+                    self.padding_info.original_shapes[col_name],
+                    self.padding_info.padded_shapes[col_name]
+                )
+        
+        # Initialize base frame directly with the already-padded data
+        JaxFrame.__init__(result, data, index or self.index)
+        
+        return result
+    
     @classmethod
     def from_arrays(
         cls,
@@ -226,7 +256,7 @@ class DistributedJaxFrame(JaxFrame):
                 else:
                     # Fallback for object types
                     result_data[col] = self.data[col] + other
-            return DistributedJaxFrame(result_data, index=self.index, sharding=self.sharding)
+            return self._create_result_frame(result_data, index=self.index, sharding=self.sharding)
         
         elif isinstance(other, DistributedJaxFrame):
             # Frame-to-frame addition
@@ -247,7 +277,7 @@ class DistributedJaxFrame(JaxFrame):
                 else:
                     result_data[col] = self.data[col]
             
-            return DistributedJaxFrame(result_data, index=self.index, sharding=self.sharding)
+            return self._create_result_frame(result_data, index=self.index, sharding=self.sharding)
         
         else:
             return NotImplemented
@@ -268,7 +298,7 @@ class DistributedJaxFrame(JaxFrame):
                     )
                 else:
                     result_data[col] = self.data[col] - other
-            return DistributedJaxFrame(result_data, index=self.index, sharding=self.sharding)
+            return self._create_result_frame(result_data, index=self.index, sharding=self.sharding)
         
         elif isinstance(other, DistributedJaxFrame):
             if self.sharding and other.sharding:
@@ -288,7 +318,7 @@ class DistributedJaxFrame(JaxFrame):
                 else:
                     result_data[col] = self.data[col]
             
-            return DistributedJaxFrame(result_data, index=self.index, sharding=self.sharding)
+            return self._create_result_frame(result_data, index=self.index, sharding=self.sharding)
         
         else:
             return NotImplemented
@@ -306,7 +336,7 @@ class DistributedJaxFrame(JaxFrame):
                     result_data[col] = self.data[col] * other
                 else:
                     result_data[col] = self.data[col] * other
-            return DistributedJaxFrame(result_data, index=self.index, sharding=self.sharding)
+            return self._create_result_frame(result_data, index=self.index, sharding=self.sharding)
         
         elif isinstance(other, DistributedJaxFrame):
             if self.sharding and other.sharding:
@@ -326,7 +356,7 @@ class DistributedJaxFrame(JaxFrame):
                 else:
                     result_data[col] = self.data[col]
             
-            return DistributedJaxFrame(result_data, index=self.index, sharding=self.sharding)
+            return self._create_result_frame(result_data, index=self.index, sharding=self.sharding)
         
         else:
             return NotImplemented
@@ -347,7 +377,7 @@ class DistributedJaxFrame(JaxFrame):
                     )
                 else:
                     result_data[col] = self.data[col] / other
-            return DistributedJaxFrame(result_data, index=self.index, sharding=self.sharding)
+            return self._create_result_frame(result_data, index=self.index, sharding=self.sharding)
         
         elif isinstance(other, DistributedJaxFrame):
             if self.sharding and other.sharding:
@@ -367,7 +397,7 @@ class DistributedJaxFrame(JaxFrame):
                 else:
                     result_data[col] = self.data[col]
             
-            return DistributedJaxFrame(result_data, index=self.index, sharding=self.sharding)
+            return self._create_result_frame(result_data, index=self.index, sharding=self.sharding)
         
         else:
             return NotImplemented
