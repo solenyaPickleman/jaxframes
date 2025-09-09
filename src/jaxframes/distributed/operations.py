@@ -22,18 +22,11 @@ def distributed_elementwise_op(
     Apply an element-wise operation to sharded arrays.
     
     For single-device cases, just applies the operation directly.
-    For multi-device, maintains sharding.
+    For multi-device, the operation on sharded arrays automatically
+    preserves sharding.
     """
-    # Apply the operation
+    # Apply the operation - if inputs are sharded, result will be too
     result = op(*arrays, **kwargs)
-    
-    # Only apply sharding if we have multiple devices
-    if sharding_spec.mesh.size > 1:
-        # For operations on already-sharded arrays, just maintain the sharding
-        # The arrays should already be properly padded if they're sharded
-        sharding = sharding_spec.get_array_sharding(result.shape)
-        # Use lax.with_sharding_constraint instead of device_put for in-context ops
-        return jax.lax.with_sharding_constraint(result, sharding)
     return result
 
 
