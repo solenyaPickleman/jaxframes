@@ -142,6 +142,9 @@ def shard_array(
     """
     Shard an array according to the given sharding specification.
     
+    This function pads the array if necessary to make it divisible by
+    the number of devices.
+    
     Parameters
     ----------
     array : Union[jnp.ndarray, np.ndarray]
@@ -152,7 +155,7 @@ def shard_array(
     Returns
     -------
     jnp.ndarray
-        Sharded JAX array
+        Sharded JAX array (padded if necessary)
     """
     # Convert to JAX array if needed
     if not isinstance(array, jnp.ndarray):
@@ -162,9 +165,19 @@ def shard_array(
     if sharding_spec.mesh.size == 1 or not (sharding_spec.row_sharding or sharding_spec.col_sharding):
         return array
     
-    # Let JAX handle the sharding - it will automatically handle uneven divisions
-    # Don't use device_put directly as it's too strict about divisibility
-    return array
+    # Check if padding is needed
+    from .padding import calculate_padded_size, pad_array
+    num_devices = sharding_spec.mesh.size
+    original_size = array.shape[0] if array.ndim > 0 else 1
+    padded_size = calculate_padded_size(original_size, num_devices)
+    
+    # Pad if necessary
+    if padded_size != original_size:
+        array = pad_array(array, padded_size, axis=0)
+    
+    # Apply sharding constraint
+    sharding = sharding_spec.get_array_sharding(array.shape)
+    return jax.lax.with_sharding_constraint(array, sharding)
 
 
 def get_shard_shape(
