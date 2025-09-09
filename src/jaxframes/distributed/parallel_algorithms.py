@@ -177,25 +177,29 @@ class ParallelRadixSort:
         Tuple[Array, Optional[Array]]
             Sorted keys and optionally reordered values
         """
+        # Store original dtype for later conversion back
+        original_dtype = keys.dtype
+        sort_keys = keys
+        
         # Handle floating point keys by converting to sortable integers
         if keys.dtype in [jnp.float32, jnp.float64]:
             # Convert floats to sortable integer representation
-            keys = self._float_to_sortable_int(keys)
+            sort_keys = self._float_to_sortable_int(keys)
         # Handle signed integers by converting to unsigned for sorting
         elif keys.dtype in [jnp.int32, jnp.int64]:
             # Convert signed to unsigned by flipping sign bit
             # This makes negative numbers sort before positive
             if keys.dtype == jnp.int32:
-                keys = keys.astype(jnp.uint32) ^ jnp.uint32(1 << 31)
+                sort_keys = keys.astype(jnp.uint32) ^ jnp.uint32(1 << 31)
             else:
-                keys = keys.astype(jnp.uint64) ^ (jnp.uint64(1) << 63)
+                sort_keys = keys.astype(jnp.uint64) ^ (jnp.uint64(1) << 63)
             
         # Determine number of passes needed
-        key_bits = 64 if keys.dtype in [jnp.int64, jnp.uint64, jnp.float64] else 32
+        key_bits = 64 if sort_keys.dtype in [jnp.int64, jnp.uint64, jnp.float64] else 32
         num_passes = key_bits // self.bits_per_pass
         
         # Process each digit position (from least to most significant)
-        current_keys = keys
+        current_keys = sort_keys
         current_values = values
         
         for pass_idx in range(num_passes):
@@ -231,8 +235,32 @@ class ParallelRadixSort:
             current_keys = current_keys[::-1]
             if current_values is not None:
                 current_values = current_values[::-1]
+        
+        # Convert keys back to original dtype
+        if original_dtype in [jnp.float32, jnp.float64]:
+            # For floats, we need to get the sorted indices and use them to reorder original keys
+            # This is needed because we can't easily reverse the float transformation
+            sorted_indices = jnp.argsort(keys)
+            if not ascending:
+                sorted_indices = sorted_indices[::-1]
+            result_keys = keys[sorted_indices]
+            if values is not None:
+                result_values = values[sorted_indices]
+            else:
+                result_values = current_values
+        elif original_dtype in [jnp.int32, jnp.int64]:
+            # Convert back from unsigned to signed by reversing the XOR operation
+            if original_dtype == jnp.int32:
+                result_keys = (current_keys ^ jnp.uint32(1 << 31)).astype(jnp.int32)
+            else:
+                result_keys = (current_keys ^ (jnp.uint64(1) << 63)).astype(jnp.int64)
+            result_values = current_values
+        else:
+            # No conversion needed
+            result_keys = current_keys
+            result_values = current_values
                 
-        return current_keys, current_values
+        return result_keys, result_values
     
     def _float_to_sortable_int(self, arr: Array) -> Array:
         """
@@ -243,12 +271,12 @@ class ParallelRadixSort:
         # View as integers based on float type
         if arr.dtype == jnp.float32:
             int_view = arr.view(jnp.int32)
-            # For float32, use appropriate bit shift
-            sign_bit = jnp.int32(1 << 31)
+            # For float32, use int32 with proper handling to avoid overflow
+            sign_bit = jnp.array(0x80000000, dtype=jnp.uint32).view(jnp.int32)
         else:
             int_view = arr.view(jnp.int64)
             # For float64, use int64 constant to avoid overflow
-            sign_bit = jnp.int64(1) << 63
+            sign_bit = jnp.array(0x8000000000000000, dtype=jnp.uint64).view(jnp.int64)
         
         # Flip sign bit and negative numbers to make them sortable
         mask = int_view < 0

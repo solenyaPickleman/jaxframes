@@ -29,6 +29,17 @@ def distributed_elementwise_op(
     
     # Only apply sharding if we have multiple devices
     if sharding_spec.mesh.size > 1:
+        # Check if result needs padding for sharding
+        from .sharding import calculate_padded_size, pad_array
+        
+        num_devices = sharding_spec.mesh.size
+        original_size = result.shape[0] if result.ndim > 0 else 1
+        padded_size = calculate_padded_size(original_size, num_devices)
+        
+        # Pad if needed
+        if padded_size != original_size:
+            result = pad_array(result, padded_size, axis=0)
+        
         sharding = sharding_spec.get_array_sharding(result.shape)
         # Use lax.with_sharding_constraint instead of device_put for in-context ops
         return jax.lax.with_sharding_constraint(result, sharding)
