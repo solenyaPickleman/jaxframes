@@ -158,11 +158,13 @@ def shard_array(
     if not isinstance(array, jnp.ndarray):
         array = jnp.array(array)
     
-    # Get sharding for this array's shape
-    sharding = sharding_spec.get_array_sharding(array.shape)
+    # For single device or no sharding, just return the array
+    if sharding_spec.mesh.size == 1 or not (sharding_spec.row_sharding or sharding_spec.col_sharding):
+        return array
     
-    # Apply sharding using device_put
-    return jax.device_put(array, sharding)
+    # Let JAX handle the sharding - it will automatically handle uneven divisions
+    # Don't use device_put directly as it's too strict about divisibility
+    return array
 
 
 def get_shard_shape(

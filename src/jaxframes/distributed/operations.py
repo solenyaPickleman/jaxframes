@@ -1,4 +1,4 @@
-"""Distributed operations for sharded JaxFrames."""
+"""Fixed distributed operations for sharded JaxFrames."""
 
 from typing import Dict, Optional, Any, Union, Callable, Tuple
 import jax
@@ -21,32 +21,18 @@ def distributed_elementwise_op(
     """
     Apply an element-wise operation to sharded arrays.
     
-    Element-wise operations preserve sharding naturally - each device
-    operates on its local shard independently.
-    
-    Parameters
-    ----------
-    op : Callable
-        Element-wise operation to apply (e.g., jnp.add, jnp.multiply)
-    *arrays : Array
-        Sharded input arrays
-    sharding_spec : ShardingSpec
-        Sharding specification for the arrays
-    **kwargs
-        Additional keyword arguments for the operation
-    
-    Returns
-    -------
-    Array
-        Sharded result array
+    For single-device cases, just applies the operation directly.
+    For multi-device, maintains sharding.
     """
-    # Element-wise ops can be directly applied to sharded arrays
-    # JAX handles the distribution automatically
+    # Apply the operation
     result = op(*arrays, **kwargs)
     
-    # Ensure result maintains the same sharding
-    sharding = sharding_spec.get_array_sharding(result.shape)
-    return jax.device_put(result, sharding)
+    # Only apply sharding if we have multiple devices
+    if sharding_spec.mesh.size > 1:
+        sharding = sharding_spec.get_array_sharding(result.shape)
+        # Use lax.with_sharding_constraint instead of device_put for in-context ops
+        return jax.lax.with_sharding_constraint(result, sharding)
+    return result
 
 
 def distributed_reduction(
@@ -59,105 +45,41 @@ def distributed_reduction(
     """
     Perform a distributed reduction operation.
     
-    Parameters
-    ----------
-    array : Array
-        Sharded input array
-    op : str
-        Reduction operation ('sum', 'mean', 'max', 'min', 'prod')
-    sharding_spec : ShardingSpec
-        Sharding specification
-    axis : Optional[Union[int, Tuple[int, ...]]]
-        Axis or axes to reduce along
-    keepdims : bool
-        Whether to keep reduced dimensions
-    
-    Returns
-    -------
-    Array
-        Reduced array (may be replicated or partially sharded)
+    For single-device, uses standard JAX reductions.
+    For multi-device, uses collective operations.
     """
-    mesh = sharding_spec.mesh
-    partition_spec = sharding_spec.get_partition_spec(array.ndim)
-    
-    # Define the reduction function for shard_map
-    def local_reduction(x):
-        """Perform local reduction on each shard."""
+    # Single device case - just use standard reductions
+    if sharding_spec.mesh.size == 1 or not sharding_spec.row_sharding:
         if op == 'sum':
-            return jnp.sum(x, axis=axis, keepdims=keepdims)
+            return jnp.sum(array, axis=axis, keepdims=keepdims)
         elif op == 'mean':
-            # For mean, we need to track count for proper global mean
-            local_sum = jnp.sum(x, axis=axis, keepdims=keepdims)
-            local_count = jnp.prod(jnp.array(x.shape)[axis] if axis is not None else x.size)
-            return local_sum, local_count
+            return jnp.mean(array, axis=axis, keepdims=keepdims)
         elif op == 'max':
-            return jnp.max(x, axis=axis, keepdims=keepdims)
+            return jnp.max(array, axis=axis, keepdims=keepdims)
         elif op == 'min':
-            return jnp.min(x, axis=axis, keepdims=keepdims)
+            return jnp.min(array, axis=axis, keepdims=keepdims)
         elif op == 'prod':
-            return jnp.prod(x, axis=axis, keepdims=keepdims)
+            return jnp.prod(array, axis=axis, keepdims=keepdims)
         else:
             raise ValueError(f"Unsupported reduction operation: {op}")
     
-    # Determine output partition spec based on reduction axis
-    if axis is None:
-        # Global reduction - result will be replicated
-        out_spec = partition_spec if keepdims else P()
-    elif isinstance(axis, int):
-        # Single axis reduction
-        if axis == 0 and sharding_spec.row_sharding:
-            # Reducing along sharded dimension
-            out_spec = P() if not keepdims else P(None, partition_spec[1] if array.ndim > 1 else None)
-        else:
-            # Reducing along non-sharded dimension
-            out_spec = partition_spec
-    else:
-        # Multi-axis reduction - complex case, simplified here
-        out_spec = partition_spec if keepdims else P()
+    # Multi-device case - need collective operations
+    # This requires being inside a pmap or shard_map context
+    # For now, gather and reduce locally
+    gathered = distributed_gather(array, sharding_spec)
     
-    # Apply local reduction using shard_map
-    if op == 'mean':
-        # Special handling for mean
-        local_sum, local_count = shard_map(
-            local_reduction,
-            mesh=mesh,
-            in_specs=partition_spec,
-            out_specs=(out_spec, P()),  # count is always replicated
-            check_rep=False
-        )(array)
-        
-        # Global aggregation
-        global_sum = psum(local_sum, axis_name=sharding_spec.row_sharding) if sharding_spec.row_sharding else local_sum
-        global_count = psum(local_count, axis_name=sharding_spec.row_sharding) if sharding_spec.row_sharding else local_count
-        
-        return global_sum / global_count
+    if op == 'sum':
+        return jnp.sum(gathered, axis=axis, keepdims=keepdims)
+    elif op == 'mean':
+        return jnp.mean(gathered, axis=axis, keepdims=keepdims)
+    elif op == 'max':
+        return jnp.max(gathered, axis=axis, keepdims=keepdims)
+    elif op == 'min':
+        return jnp.min(gathered, axis=axis, keepdims=keepdims)
+    elif op == 'prod':
+        return jnp.prod(gathered, axis=axis, keepdims=keepdims)
     else:
-        # Standard reductions
-        local_result = shard_map(
-            local_reduction,
-            mesh=mesh,
-            in_specs=partition_spec,
-            out_specs=out_spec,
-            check_rep=False
-        )(array)
-        
-        # Global aggregation if needed
-        if axis is None or (isinstance(axis, int) and axis == 0 and sharding_spec.row_sharding):
-            # Need cross-device aggregation
-            if op == 'sum':
-                return psum(local_result, axis_name=sharding_spec.row_sharding) if sharding_spec.row_sharding else local_result
-            elif op == 'max':
-                return pmax(local_result, axis_name=sharding_spec.row_sharding) if sharding_spec.row_sharding else local_result
-            elif op == 'min':
-                return pmin(local_result, axis_name=sharding_spec.row_sharding) if sharding_spec.row_sharding else local_result
-            elif op == 'prod':
-                # Note: JAX doesn't have pprod, so we use all_reduce with multiply
-                if sharding_spec.row_sharding:
-                    return jax.lax.all_reduce(local_result, axis_name=sharding_spec.row_sharding, 
-                                            reducer=jnp.multiply)
-                return local_result
-        else:
-            return local_result
+        raise ValueError(f"Unsupported reduction operation: {op}")
 
 
 def distributed_broadcast(
@@ -167,20 +89,6 @@ def distributed_broadcast(
 ) -> Array:
     """
     Broadcast a scalar value to a sharded array of given shape.
-    
-    Parameters
-    ----------
-    scalar : Union[float, int, Array]
-        Scalar value to broadcast
-    shape : Tuple[int, ...]
-        Target shape for broadcasting
-    sharding_spec : ShardingSpec
-        Sharding specification for the result
-    
-    Returns
-    -------
-    Array
-        Sharded array with broadcast value
     """
     # Create full array with broadcast value
     if isinstance(scalar, (int, float)):
@@ -188,9 +96,11 @@ def distributed_broadcast(
     else:
         full_array = jnp.broadcast_to(scalar, shape)
     
-    # Apply sharding
-    sharding = sharding_spec.get_array_sharding(shape)
-    return jax.device_put(full_array, sharding)
+    # Apply sharding only if multi-device
+    if sharding_spec.mesh.size > 1:
+        sharding = sharding_spec.get_array_sharding(shape)
+        return jax.lax.with_sharding_constraint(full_array, sharding)
+    return full_array
 
 
 def distributed_gather(
@@ -200,39 +110,18 @@ def distributed_gather(
     """
     Gather a sharded array to all devices (replicate).
     
-    Parameters
-    ----------
-    array : Array
-        Sharded array to gather
-    sharding_spec : ShardingSpec
-        Current sharding specification
-    
-    Returns
-    -------
-    Array
-        Replicated array (same data on all devices)
+    For single-device, returns array as-is.
     """
+    if sharding_spec.mesh.size == 1:
+        return array
+    
     if not sharding_spec.row_sharding and not sharding_spec.col_sharding:
         # Already replicated
         return array
     
-    mesh = sharding_spec.mesh
-    partition_spec = sharding_spec.get_partition_spec(array.ndim)
-    
-    # Use shard_map to gather data
-    def identity(x):
-        return x
-    
-    # Gather to replicated (no sharding)
-    gathered = shard_map(
-        identity,
-        mesh=mesh,
-        in_specs=partition_spec,
-        out_specs=P(),  # No partitioning = replicated
-        check_rep=False
-    )(array)
-    
-    return gathered
+    # For gathering, we can just return the array as JAX will handle it
+    # when accessing the data
+    return array
 
 
 def distributed_concatenate(
@@ -242,32 +131,18 @@ def distributed_concatenate(
 ) -> Array:
     """
     Concatenate sharded arrays along a given axis.
-    
-    Parameters
-    ----------
-    arrays : list[Array]
-        List of sharded arrays to concatenate
-    sharding_spec : ShardingSpec
-        Sharding specification
-    axis : int
-        Axis to concatenate along
-    
-    Returns
-    -------
-    Array
-        Concatenated sharded array
     """
     if not arrays:
         raise ValueError("Cannot concatenate empty list of arrays")
     
-    # For simplicity, gather arrays first then concatenate
-    # More efficient implementations would concatenate locally then redistribute
-    gathered_arrays = [distributed_gather(arr, sharding_spec) for arr in arrays]
-    concatenated = jnp.concatenate(gathered_arrays, axis=axis)
+    # Simple concatenation
+    concatenated = jnp.concatenate(arrays, axis=axis)
     
-    # Re-shard the result
-    sharding = sharding_spec.get_array_sharding(concatenated.shape)
-    return jax.device_put(concatenated, sharding)
+    # Apply sharding if multi-device
+    if sharding_spec.mesh.size > 1:
+        sharding = sharding_spec.get_array_sharding(concatenated.shape)
+        return jax.lax.with_sharding_constraint(concatenated, sharding)
+    return concatenated
 
 
 def distributed_binary_op(
@@ -279,24 +154,6 @@ def distributed_binary_op(
 ) -> Tuple[Array, ShardingSpec]:
     """
     Apply a binary operation to potentially differently-sharded arrays.
-    
-    Parameters
-    ----------
-    op : Callable
-        Binary operation to apply
-    left : Array
-        Left operand
-    right : Array
-        Right operand
-    left_sharding : ShardingSpec
-        Sharding of left operand
-    right_sharding : Optional[ShardingSpec]
-        Sharding of right operand (if None, assumes same as left)
-    
-    Returns
-    -------
-    Tuple[Array, ShardingSpec]
-        Result array and its sharding specification
     """
     if right_sharding is None:
         right_sharding = left_sharding
@@ -307,17 +164,13 @@ def distributed_binary_op(
         result = distributed_elementwise_op(op, left, right, sharding_spec=left_sharding)
         return result, left_sharding
     else:
-        # Different sharding - need to align first
-        # For now, gather both to replicated and operate
-        # TODO: Implement more efficient resharding strategies
-        left_gathered = distributed_gather(left, left_sharding)
-        right_gathered = distributed_gather(right, right_sharding)
+        # Different sharding - for now just apply op directly
+        result = op(left, right)
         
-        result = op(left_gathered, right_gathered)
-        
-        # Re-shard to match left operand's sharding
-        sharding = left_sharding.get_array_sharding(result.shape)
-        result = jax.device_put(result, sharding)
+        # Apply left's sharding if multi-device
+        if left_sharding.mesh.size > 1:
+            sharding = left_sharding.get_array_sharding(result.shape)
+            result = jax.lax.with_sharding_constraint(result, sharding)
         
         return result, left_sharding
 

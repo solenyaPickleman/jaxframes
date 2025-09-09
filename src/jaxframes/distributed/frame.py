@@ -143,7 +143,14 @@ class DistributedJaxFrame(JaxFrame):
     def __add__(self, other):
         """Distributed addition."""
         if self.sharding is None:
-            return super().__add__(other)
+            # No sharding - do simple addition
+            if isinstance(other, (int, float)):
+                result_data = {}
+                for col in self.columns:
+                    result_data[col] = self.data[col] + other
+                return DistributedJaxFrame(result_data, index=self.index, sharding=None)
+            else:
+                return NotImplemented
         
         if isinstance(other, (int, float)):
             # Scalar addition
