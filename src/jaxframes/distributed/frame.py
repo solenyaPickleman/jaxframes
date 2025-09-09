@@ -18,6 +18,9 @@ from .operations import (
     DistributedOps, distributed_elementwise_op,
     distributed_reduction, distributed_broadcast, distributed_gather
 )
+from .padding import (
+    PaddingInfo, calculate_padded_size, pad_array, unpad_array
+)
 
 
 class DistributedJaxFrame(JaxFrame):
@@ -44,15 +47,55 @@ class DistributedJaxFrame(JaxFrame):
         sharding: Optional[ShardingSpec] = None
     ):
         """Initialize a DistributedJaxFrame."""
-        # Initialize base JaxFrame
-        super().__init__(data, index)
-        
         # Store sharding specification
         self.sharding = sharding
+        
+        # Initialize padding info
+        num_devices = sharding.mesh.size if sharding else 1
+        self.padding_info = PaddingInfo(num_devices)
+        
+        # Apply padding if needed for sharding
+        if sharding is not None:
+            data = self._prepare_data_for_sharding(data)
+        
+        # Initialize base JaxFrame with potentially padded data
+        super().__init__(data, index)
         
         # If sharding is specified, shard the data
         if sharding is not None:
             self._apply_sharding()
+    
+    def _prepare_data_for_sharding(self, data: Dict[str, Union[Array, np.ndarray]]) -> Dict[str, Union[Array, np.ndarray]]:
+        """Prepare data for sharding by padding arrays if needed."""
+        if self.sharding is None:
+            return data
+        
+        num_devices = self.sharding.mesh.size
+        padded_data = {}
+        
+        for col_name, arr in data.items():
+            if isinstance(arr, (jax.Array, jnp.ndarray)) and arr.dtype != np.object_:
+                # Calculate padded size
+                original_shape = arr.shape
+                padded_size = calculate_padded_size(original_shape[0], num_devices)
+                
+                # Pad if needed
+                if padded_size != original_shape[0]:
+                    arr = pad_array(arr, padded_size, axis=0)
+                    padded_shape = arr.shape
+                else:
+                    padded_shape = original_shape
+                
+                # Store padding info
+                self.padding_info.add_column(col_name, original_shape, padded_shape)
+                padded_data[col_name] = arr
+            else:
+                # Non-JAX arrays remain unchanged
+                padded_data[col_name] = arr
+                if hasattr(arr, 'shape'):
+                    self.padding_info.add_column(col_name, arr.shape, arr.shape)
+        
+        return padded_data
     
     def _apply_sharding(self):
         """Apply sharding to all JAX arrays in the frame."""
@@ -133,6 +176,12 @@ class DistributedJaxFrame(JaxFrame):
             if isinstance(arr, (jax.Array, jnp.ndarray)) and arr.dtype != np.object_:
                 # Gather JAX arrays
                 gathered = distributed_gather(arr, self.sharding)
+                
+                # Unpad to original size if needed
+                original_size = self.padding_info.get_original_size(col_name, axis=0)
+                if original_size is not None and original_size != gathered.shape[0]:
+                    gathered = unpad_array(gathered, original_size, axis=0)
+                
                 gathered_data[col_name] = np.array(gathered)
             else:
                 # Keep object arrays as-is
@@ -506,7 +555,8 @@ def _dist_tree_flatten(frame):
     # Separate JAX arrays from metadata
     jax_data = {}
     aux_data = {'columns': frame.columns, 'index': frame.index, 
-                'sharding': frame.sharding, 'dtypes': frame._dtypes}
+                'sharding': frame.sharding, 'dtypes': frame._dtypes,
+                'padding_info': frame.padding_info}
     
     for col in frame.columns:
         if isinstance(frame.data[col], (jax.Array, jnp.ndarray)) and frame.data[col].dtype != np.object_:
@@ -540,6 +590,7 @@ def _dist_tree_unflatten(aux_data, flat_contents):
     frame.index = metadata['index']
     frame.sharding = metadata['sharding']
     frame._dtypes = metadata['dtypes']
+    frame.padding_info = metadata.get('padding_info', PaddingInfo())
     frame._length = len(next(iter(data.values()))) if data else 0
     
     return frame
