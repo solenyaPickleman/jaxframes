@@ -98,8 +98,9 @@ def distributed_broadcast(
     
     # Apply sharding only if multi-device
     if sharding_spec.mesh.size > 1:
-        sharding = sharding_spec.get_array_sharding(shape)
-        return jax.lax.with_sharding_constraint(full_array, sharding)
+        # Note: The shape should already be padded by the caller
+        # We don't apply sharding constraint here as it happens at operation level
+        return full_array
     return full_array
 
 

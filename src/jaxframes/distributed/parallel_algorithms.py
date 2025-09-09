@@ -181,9 +181,17 @@ class ParallelRadixSort:
         if keys.dtype in [jnp.float32, jnp.float64]:
             # Convert floats to sortable integer representation
             keys = self._float_to_sortable_int(keys)
+        # Handle signed integers by converting to unsigned for sorting
+        elif keys.dtype in [jnp.int32, jnp.int64]:
+            # Convert signed to unsigned by flipping sign bit
+            # This makes negative numbers sort before positive
+            if keys.dtype == jnp.int32:
+                keys = keys.astype(jnp.uint32) ^ jnp.uint32(1 << 31)
+            else:
+                keys = keys.astype(jnp.uint64) ^ (jnp.uint64(1) << 63)
             
         # Determine number of passes needed
-        key_bits = 64 if keys.dtype in [jnp.int64, jnp.float64] else 32
+        key_bits = 64 if keys.dtype in [jnp.int64, jnp.uint64, jnp.float64] else 32
         num_passes = key_bits // self.bits_per_pass
         
         # Process each digit position (from least to most significant)
@@ -232,12 +240,19 @@ class ParallelRadixSort:
         
         Uses a bit manipulation trick to make float sorting work with integer radix sort.
         """
-        # View as integers
-        int_view = jnp.asarray(arr.view(jnp.int32 if arr.dtype == jnp.float32 else jnp.int64))
+        # View as integers based on float type
+        if arr.dtype == jnp.float32:
+            int_view = arr.view(jnp.int32)
+            # For float32, use appropriate bit shift
+            sign_bit = jnp.int32(1 << 31)
+        else:
+            int_view = arr.view(jnp.int64)
+            # For float64, use int64 constant to avoid overflow
+            sign_bit = jnp.int64(1) << 63
         
         # Flip sign bit and negative numbers to make them sortable
         mask = int_view < 0
-        int_view = jnp.where(mask, ~int_view, int_view | (1 << 63))
+        int_view = jnp.where(mask, ~int_view, int_view | sign_bit)
         
         return int_view
 

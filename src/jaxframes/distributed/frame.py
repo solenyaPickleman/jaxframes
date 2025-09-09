@@ -205,15 +205,12 @@ class DistributedJaxFrame(JaxFrame):
                 return NotImplemented
         
         if isinstance(other, (int, float)):
-            # Scalar addition
+            # Scalar addition - arrays are already sharded, just add directly
             result_data = {}
             for col in self.columns:
                 if self._dtypes[col] != 'object':
-                    result_data[col] = DistributedOps.add(
-                        self.data[col],
-                        distributed_broadcast(other, self.data[col].shape, self.sharding),
-                        self.sharding
-                    )
+                    # Direct addition works because arrays are already sharded
+                    result_data[col] = self.data[col] + other
                 else:
                     # Fallback for object types
                     result_data[col] = self.data[col] + other
@@ -293,11 +290,8 @@ class DistributedJaxFrame(JaxFrame):
             result_data = {}
             for col in self.columns:
                 if self._dtypes[col] != 'object':
-                    result_data[col] = DistributedOps.multiply(
-                        self.data[col],
-                        distributed_broadcast(other, self.data[col].shape, self.sharding),
-                        self.sharding
-                    )
+                    # Direct multiplication - arrays are already sharded
+                    result_data[col] = self.data[col] * other
                 else:
                     result_data[col] = self.data[col] * other
             return DistributedJaxFrame(result_data, index=self.index, sharding=self.sharding)
