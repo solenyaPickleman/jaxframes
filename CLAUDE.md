@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 JaxFrames is a pandas-compatible DataFrame library that runs natively on TPUs using JAX. It provides massive performance gains through distributed execution while maintaining API familiarity for pandas users.
 
-**Current Status**: Stages 0-3 complete (foundation, core data structures with auto-JIT, multi-device foundation, core parallel algorithms). Stage 4 (lazy execution engine) is next.
+**Current Status**: Stages 0-3.5 complete (foundation, core data structures with auto-JIT, multi-device foundation, core parallel algorithms, multi-column operations). Stage 4 (lazy execution engine) is next.
 
 ## Development Commands
 
@@ -104,12 +104,11 @@ For TPU VMs, the notebook handles process cleanup (`pkill -f libtpu.so`) automat
 **Implemented**:
 - Basic operations: `+`, `-`, `*`, `/`, column selection, assignment
 - Reductions: `sum()`, `mean()`, `max()`, `min()`, `std()`, `var()`
-- Sorting: `sort_values()` (single column, numerical only)
-- GroupBy: `groupby().agg()` with sum, mean, max, min, count
-- Joins: `merge()` with inner, left, right, outer (single column, numerical only)
+- Sorting: `sort_values()` (multi-column with mixed ascending/descending, numerical only)
+- GroupBy: `groupby().agg()` with sum, mean, max, min, count (multi-column support)
+- Joins: `merge()` with inner, left, right, outer (multi-column support, numerical only)
 
 **Not Yet Implemented**:
-- Multi-column sorting/groupby/joins
 - String operations (framework exists in git history if needed)
 - Window functions
 - Time series operations

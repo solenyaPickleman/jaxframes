@@ -334,17 +334,17 @@ def merge_join(left: JaxFrame, right: JaxFrame, on: str) -> JaxFrame:
 - ✅ Joins scale efficiently with dataset size and device count
 - ✅ All operations maintain correctness vs pandas reference
 
-### Stage 3.5: Enhanced Parallel Algorithms (Optional, 4 weeks)
+### ✅ Stage 3.5: Enhanced Parallel Algorithms (COMPLETED)
 
 **Objective**: Extend parallel algorithms to support advanced use cases
 
-**Priority Features**:
+**✅ Completed Features**:
 
-1. **Multi-Column Operations (2 weeks)**:
-   - Compound sorting by multiple keys
-   - Multi-column groupby operations
-   - Composite key joins
-   - Implementation: Combine keys into single sortable value
+1. **✅ Multi-Column Operations**:
+   - ✅ Compound sorting by multiple keys with mixed ascending/descending
+   - ✅ Multi-column groupby operations with aggregations
+   - ✅ Composite key joins (inner, left, right, outer)
+   - ✅ Implementation: Bit-shifted composite keys preserving unique combinations
 
 2. **String Support (2 weeks)**:
    - Hash-based string operations

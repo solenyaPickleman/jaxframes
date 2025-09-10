@@ -24,6 +24,112 @@ import numpy as np
 from .sharding import ShardingSpec
 
 
+def multi_column_lexsort(keys: List[Array], ascending: Union[bool, List[bool]] = True) -> Array:
+    """
+    Get indices that would sort multiple arrays lexicographically.
+    
+    This is the JAX-native way to handle multi-column sorting,
+    using stable sorts from last key to first.
+    
+    Parameters
+    ----------
+    keys : List[Array]
+        List of arrays to sort by, in order of priority
+    ascending : bool or List[bool]
+        Sort order for each key
+        
+    Returns
+    -------
+    Array
+        Indices that would sort the arrays lexicographically
+    """
+    if len(keys) == 1:
+        return jnp.argsort(keys[0], stable=True)
+    
+    # Handle ascending parameter
+    if isinstance(ascending, bool):
+        ascending = [ascending] * len(keys)
+    
+    n = len(keys[0])
+    indices = jnp.arange(n)
+    
+    # Sort by each column from last to first (stable sort preserves order)
+    for arr, asc in zip(reversed(keys), reversed(ascending)):
+        if not asc:
+            # For descending, negate numerics or use reverse indices
+            if arr.dtype in [jnp.float32, jnp.float64]:
+                arr = -arr
+            else:
+                arr = jnp.max(arr) - arr
+        # Use stable=True to preserve previous orderings
+        sort_idx = jnp.argsort(arr[indices], stable=True)
+        indices = indices[sort_idx]
+    
+    return indices
+
+
+def hash_multi_columns(keys: List[Array]) -> Array:
+    """
+    Create a hash for multiple columns that preserves uniqueness.
+    
+    Uses a polynomial rolling hash that's JAX-compatible and works
+    well for both equality checking and distribution.
+    
+    Parameters
+    ----------
+    keys : List[Array]
+        List of arrays to hash together
+        
+    Returns
+    -------
+    Array
+        Hash values for each row
+    """
+    if len(keys) == 1:
+        # For single key, just return it (or hash it if needed)
+        key = keys[0]
+        if key.dtype in [jnp.float32, jnp.float64]:
+            # For floats, use bit representation
+            return key.view(jnp.uint32 if key.dtype == jnp.float32 else jnp.uint32)
+        return key.astype(jnp.uint32)
+    
+    # Use polynomial rolling hash
+    # This is more robust than combining ranks
+    PRIME = jnp.uint32(2**31 - 1)
+    MULT = jnp.uint32(31)
+    
+    # Start with zeros
+    hash_vals = jnp.zeros(len(keys[0]), dtype=jnp.uint32)
+    
+    for key in keys:
+        # Convert to integers if needed
+        if key.dtype in [jnp.float32, jnp.float64]:
+            # Use bit representation for floats
+            if key.dtype == jnp.float32:
+                key_int = key.view(jnp.uint32)
+            else:
+                # For float64, take lower 32 bits
+                key_int = key.view(jnp.uint32)
+        else:
+            key_int = key.astype(jnp.uint32)
+        
+        # Rolling hash: hash = (hash * MULT + key) % PRIME
+        hash_vals = ((hash_vals * MULT) + key_int) % PRIME
+    
+    return hash_vals
+
+
+def combine_keys_for_sorting(keys: List[Array]) -> Array:
+    """
+    Legacy function - redirects to multi_column_lexsort for compatibility.
+    """
+    indices = multi_column_lexsort(keys)
+    # Return ranks for backward compatibility
+    ranks = jnp.zeros(len(indices), dtype=jnp.int32)
+    ranks = ranks.at[indices].set(jnp.arange(len(indices)))
+    return ranks
+
+
 class ParallelRadixSort:
     """
     Massively parallel radix sort implementation for distributed arrays.
@@ -154,6 +260,43 @@ class ParallelRadixSort:
             
         return redistributed_keys, redistributed_values
     
+    def sort_multi_column(
+        self,
+        keys: List[Array],
+        values: Optional[Dict[str, Array]] = None,
+        ascending: Union[bool, List[bool]] = True
+    ) -> Tuple[List[Array], Optional[Dict[str, Array]]]:
+        """
+        Sort by multiple columns with individual sort orders.
+        
+        Uses the JAX-native lexicographic sorting approach with stable sorts.
+        
+        Parameters
+        ----------
+        keys : List[Array]
+            List of key arrays to sort by, in order of priority
+        values : Dict[str, Array], optional
+            Dictionary of value arrays to reorder along with keys
+        ascending : bool or List[bool]
+            Sort order for each key column
+            
+        Returns
+        -------
+        Tuple[List[Array], Optional[Dict[str, Array]]]
+            Sorted keys and optionally reordered values
+        """
+        # Use the new lexicographic sort function
+        indices = multi_column_lexsort(keys, ascending)
+        
+        # Reorder all keys and values using the sorted indices
+        sorted_keys = [key[indices] for key in keys]
+        
+        sorted_values = None
+        if values is not None:
+            sorted_values = {col: arr[indices] for col, arr in values.items()}
+        
+        return sorted_keys, sorted_values
+
     def sort(
         self, 
         keys: Array, 
@@ -353,6 +496,71 @@ class SortBasedGroupBy:
         else:
             raise ValueError(f"Unsupported aggregation function: {agg_func}")
     
+    def groupby_aggregate_multi_column(
+        self,
+        keys: List[Array],
+        key_names: List[str],
+        values: Dict[str, Array],
+        agg_funcs: Dict[str, str]
+    ) -> Tuple[Dict[str, Array], Dict[str, Array]]:
+        """
+        Perform groupby aggregation on multiple columns.
+        
+        Uses lexicographic sorting and proper boundary detection.
+        
+        Parameters
+        ----------
+        keys : List[Array]
+            List of grouping key arrays
+        key_names : List[str]
+            Names of the key columns
+        values : Dict[str, Array]
+            Dictionary of column names to value arrays
+        agg_funcs : Dict[str, str]
+            Dictionary mapping column names to aggregation functions
+            
+        Returns
+        -------
+        Tuple[Dict[str, Array], Dict[str, Array]]
+            Dictionary of unique key columns and aggregated values
+        """
+        # Use lexicographic sort to group rows
+        indices = multi_column_lexsort(keys)
+        
+        # Now find unique key combinations
+        n = len(keys[0])
+        is_new_group = jnp.zeros(n, dtype=bool)
+        is_new_group = is_new_group.at[0].set(True)
+        
+        # Check where any key changes from previous row
+        for key in keys:
+            sorted_key = key[indices]
+            # Compare with previous element
+            key_changes = sorted_key[1:] != sorted_key[:-1]
+            # Update is_new_group for positions 1 onwards
+            is_new_group = is_new_group.at[1:].set(is_new_group[1:] | key_changes)
+        
+        # Get unique key values
+        unique_keys = {}
+        for i, key_name in enumerate(key_names):
+            sorted_key = keys[i][indices]
+            unique_keys[key_name] = sorted_key[is_new_group]
+        
+        # Create segment IDs for aggregation
+        segment_ids = jnp.cumsum(is_new_group) - 1
+        num_segments = segment_ids[-1] + 1
+        
+        # Apply aggregations
+        aggregated_values = {}
+        for col_name, agg_func in agg_funcs.items():
+            sorted_vals = values[col_name][indices]
+            aggregated = self._apply_aggregation_vectorized(
+                sorted_vals, segment_ids, agg_func, num_segments
+            )
+            aggregated_values[col_name] = aggregated
+        
+        return unique_keys, aggregated_values
+
     def groupby_aggregate(
         self,
         keys: Array,
@@ -443,6 +651,198 @@ class ParallelSortMergeJoin:
         self.sharding_spec = sharding_spec
         self.sorter = ParallelRadixSort(sharding_spec)
         
+    def join_multi_column(
+        self,
+        left_keys: List[Array],
+        left_key_names: List[str],
+        left_values: Dict[str, Array],
+        right_keys: List[Array],
+        right_key_names: List[str],
+        right_values: Dict[str, Array],
+        how: str = 'inner'
+    ) -> Tuple[Dict[str, Array], Dict[str, Array]]:
+        """
+        Perform a vectorized multi-column join using broadcasting.
+        
+        This approach is more JAX-native and handles multi-column
+        matching correctly.
+        
+        Parameters
+        ----------
+        left_keys : List[Array]
+            List of join key arrays from left table
+        left_key_names : List[str]
+            Names of left join columns
+        left_values : Dict[str, Array]
+            Left table column values
+        right_keys : List[Array]
+            List of join key arrays from right table
+        right_key_names : List[str]
+            Names of right join columns
+        right_values : Dict[str, Array]
+            Right table column values
+        how : str
+            Join type ('inner', 'left', 'right', 'outer')
+            
+        Returns
+        -------
+        Tuple[Dict[str, Array], Dict[str, Array]]
+            Dictionary of joined keys and combined values from both tables
+        """
+        n_left = len(left_keys[0])
+        n_right = len(right_keys[0])
+        
+        # Create match matrix using broadcasting
+        # Start with all True, then AND with each key comparison
+        matches = jnp.ones((n_left, n_right), dtype=bool)
+        
+        for l_key, r_key in zip(left_keys, right_keys):
+            # Check each key pair using broadcasting
+            key_matches = l_key[:, None] == r_key[None, :]
+            matches = matches & key_matches
+        
+        if how == 'inner':
+            # Get indices of matches
+            left_idx, right_idx = jnp.where(matches)
+            
+            # Extract matched keys (use left keys for consistency)
+            joined_keys = {}
+            for i, key_name in enumerate(left_key_names):
+                joined_keys[key_name] = left_keys[i][left_idx]
+            
+            # Extract values
+            joined_values = {}
+            for name, arr in left_values.items():
+                joined_values[f'left_{name}'] = arr[left_idx]
+            for name, arr in right_values.items():
+                joined_values[f'right_{name}'] = arr[right_idx]
+                
+        elif how == 'left':
+            # Keep all left rows
+            # For each left row, find if there's a match
+            has_match = jnp.any(matches, axis=1)
+            
+            # For matched rows, get the right indices
+            # For unmatched, use -1 as placeholder
+            result_size = n_left
+            left_idx = jnp.arange(n_left)
+            
+            # Get first matching right index for each left row
+            right_idx = jnp.where(
+                has_match,
+                jnp.argmax(matches, axis=1),  # First match
+                -1  # No match
+            )
+            
+            # Extract keys
+            joined_keys = {}
+            for i, key_name in enumerate(left_key_names):
+                joined_keys[key_name] = left_keys[i]
+            
+            # Extract values
+            joined_values = {}
+            for name, arr in left_values.items():
+                joined_values[f'left_{name}'] = arr
+            
+            # For right values, use NaN for non-matches
+            for name, arr in right_values.items():
+                valid_mask = right_idx >= 0
+                result = jnp.where(
+                    valid_mask,
+                    arr[jnp.maximum(right_idx, 0)],  # Use 0 for -1 to avoid index error
+                    jnp.nan
+                )
+                joined_values[f'right_{name}'] = result
+                
+        elif how == 'right':
+            # Similar to left but swap roles
+            has_match = jnp.any(matches, axis=0)
+            right_idx = jnp.arange(n_right)
+            left_idx = jnp.where(
+                has_match,
+                jnp.argmax(matches, axis=0),
+                -1
+            )
+            
+            joined_keys = {}
+            for i, key_name in enumerate(right_key_names):
+                joined_keys[key_name] = right_keys[i]
+            
+            joined_values = {}
+            for name, arr in right_values.items():
+                joined_values[f'right_{name}'] = arr
+                
+            for name, arr in left_values.items():
+                valid_mask = left_idx >= 0
+                result = jnp.where(
+                    valid_mask,
+                    arr[jnp.maximum(left_idx, 0)],
+                    jnp.nan
+                )
+                joined_values[f'left_{name}'] = result
+                
+        else:  # outer
+            # Combine inner join with unmatched from both sides
+            # First get inner join results
+            left_idx_inner, right_idx_inner = jnp.where(matches)
+            
+            # Find unmatched left rows
+            left_has_match = jnp.any(matches, axis=1)
+            left_unmatched = jnp.where(~left_has_match)[0]
+            
+            # Find unmatched right rows
+            right_has_match = jnp.any(matches, axis=0)
+            right_unmatched = jnp.where(~right_has_match)[0]
+            
+            # Combine all indices
+            # Inner matches + left unmatched + right unmatched
+            all_left_idx = jnp.concatenate([
+                left_idx_inner,
+                left_unmatched,
+                jnp.full(len(right_unmatched), -1)
+            ])
+            all_right_idx = jnp.concatenate([
+                right_idx_inner,
+                jnp.full(len(left_unmatched), -1),
+                right_unmatched
+            ])
+            
+            # Extract keys (use left keys where available, right otherwise)
+            joined_keys = {}
+            for i, key_name in enumerate(left_key_names):
+                left_part = jnp.where(
+                    all_left_idx >= 0,
+                    left_keys[i][jnp.maximum(all_left_idx, 0)],
+                    jnp.nan
+                )
+                right_part = jnp.where(
+                    (all_left_idx < 0) & (all_right_idx >= 0),
+                    right_keys[i][jnp.maximum(all_right_idx, 0)],
+                    jnp.nan
+                )
+                joined_keys[key_name] = jnp.where(
+                    all_left_idx >= 0,
+                    left_part,
+                    right_part
+                )
+            
+            # Extract values with NaN for missing
+            joined_values = {}
+            for name, arr in left_values.items():
+                joined_values[f'left_{name}'] = jnp.where(
+                    all_left_idx >= 0,
+                    arr[jnp.maximum(all_left_idx, 0)],
+                    jnp.nan
+                )
+            for name, arr in right_values.items():
+                joined_values[f'right_{name}'] = jnp.where(
+                    all_right_idx >= 0,
+                    arr[jnp.maximum(all_right_idx, 0)],
+                    jnp.nan
+                )
+        
+        return joined_keys, joined_values
+
     def join(
         self,
         left_keys: Array,

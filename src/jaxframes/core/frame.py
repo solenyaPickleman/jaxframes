@@ -416,7 +416,7 @@ class JaxFrame:
             return JaxFrame(result_data, index=self.index)
         return NotImplemented
     
-    def sort_values(self, by: Union[str, List[str]], ascending: bool = True) -> 'JaxFrame':
+    def sort_values(self, by: Union[str, List[str]], ascending: Union[bool, List[bool]] = True) -> 'JaxFrame':
         """
         Sort DataFrame by specified column(s).
         
@@ -424,7 +424,7 @@ class JaxFrame:
         ----------
         by : str or List[str]
             Column name(s) to sort by
-        ascending : bool
+        ascending : bool or List[bool]
             Sort order (default True for ascending)
             
         Returns
@@ -433,39 +433,63 @@ class JaxFrame:
             New sorted DataFrame
         """
         # Import here to avoid circular dependency
-        # Use fast JIT-compiled version for better performance
-        from ..distributed.fast_algorithms import parallel_sort
+        from ..distributed.parallel_algorithms import ParallelRadixSort, ShardingSpec
+        from jax.sharding import Mesh
         
         # Handle single column name
         if isinstance(by, str):
             by = [by]
         
-        # For now, support single column sorting
-        if len(by) > 1:
-            raise NotImplementedError("Multi-column sorting not yet implemented")
+        # Validate columns exist and check types
+        for col in by:
+            if col not in self.columns:
+                raise KeyError(f"Column '{col}' not found")
+            if self._dtypes[col] == 'object':
+                raise TypeError(f"Cannot sort by object dtype column '{col}'")
         
-        sort_col = by[0]
-        if sort_col not in self.columns:
-            raise KeyError(f"Column '{sort_col}' not found")
+        # Create sharding spec for sorting
+        mesh = Mesh(jax.devices()[:1], axis_names=('devices',))
+        sharding_spec = ShardingSpec(mesh=mesh, row_sharding=False)
+        sorter = ParallelRadixSort(sharding_spec)
         
-        # Get the sort column data
-        keys = self.data[sort_col]
+        if len(by) == 1:
+            # Single column sort
+            sort_col = by[0]
+            keys = self.data[sort_col]
+            
+            # Create array of row indices to track reordering
+            row_indices = jnp.arange(len(keys))
+            
+            # Perform parallel sort
+            sorted_keys, sorted_indices = sorter.sort(
+                keys, 
+                values=row_indices,
+                ascending=ascending if isinstance(ascending, bool) else ascending[0]
+            )
+        else:
+            # Multi-column sort
+            keys = [self.data[col] for col in by]
+            
+            # Prepare values dict with all other columns
+            values_dict = {col: self.data[col] for col in self.columns if col not in by}
+            
+            # Perform multi-column sort
+            sorted_keys, sorted_values = sorter.sort_multi_column(
+                keys,
+                values=values_dict,
+                ascending=ascending
+            )
+            
+            # Combine sorted keys and values
+            result_data = {}
+            for i, col in enumerate(by):
+                result_data[col] = sorted_keys[i]
+            if sorted_values:
+                result_data.update(sorted_values)
+            
+            return JaxFrame(result_data, index=None)
         
-        # Check if column is numeric
-        if self._dtypes[sort_col] == 'object':
-            raise TypeError("Cannot sort object dtype columns with parallel sort")
-        
-        # Create array of row indices to track reordering
-        row_indices = jnp.arange(len(keys))
-        
-        # Perform parallel sort
-        sorted_keys, sorted_indices = parallel_sort(
-            keys, 
-            values=row_indices,
-            ascending=ascending
-        )
-        
-        # Reorder all columns based on sorted indices
+        # For single column, reorder all columns based on sorted indices
         result_data = {}
         for col in self.columns:
             if self._dtypes[col] != 'object':
@@ -499,33 +523,53 @@ class JaxFrame:
             def __init__(self, frame, by):
                 self.frame = frame
                 self.by = [by] if isinstance(by, str) else by
-                if len(self.by) > 1:
-                    raise NotImplementedError("Multi-column groupby not yet implemented")
+                # Validate all group columns
+                for col in self.by:
+                    if col not in self.frame.columns:
+                        raise KeyError(f"Column '{col}' not found")
+                    if self.frame._dtypes[col] == 'object':
+                        raise TypeError(f"Cannot group by object dtype column '{col}'")
             
             def agg(self, agg_funcs):
-                from ..distributed.fast_algorithms import groupby_aggregate
+                from ..distributed.parallel_algorithms import SortBasedGroupBy, ShardingSpec
+                from jax.sharding import Mesh
                 
-                group_col = self.by[0]
-                if self.frame._dtypes[group_col] == 'object':
-                    raise TypeError("Cannot group by object dtype columns")
+                # Create sharding spec
+                mesh = Mesh(jax.devices()[:1], axis_names=('devices',))
+                sharding_spec = ShardingSpec(mesh=mesh, row_sharding=False)
+                groupby_obj = SortBasedGroupBy(sharding_spec)
                 
                 # Prepare aggregation functions
                 if isinstance(agg_funcs, str):
                     agg_dict = {}
                     for col in self.frame.columns:
-                        if col != group_col and self.frame._dtypes[col] != 'object':
+                        if col not in self.by and self.frame._dtypes[col] != 'object':
                             agg_dict[col] = agg_funcs
                 else:
                     agg_dict = agg_funcs
                 
-                # Validate and perform aggregation
-                keys = self.frame.data[group_col]
-                values = {col: self.frame.data[col] for col in agg_dict.keys()}
-                
-                unique_keys, aggregated = groupby_aggregate(keys, values, agg_dict)
-                
-                result_data = {group_col: unique_keys}
-                result_data.update(aggregated)
+                # Prepare keys and values
+                if len(self.by) == 1:
+                    # Single column groupby
+                    group_col = self.by[0]
+                    keys = self.frame.data[group_col]
+                    values = {col: self.frame.data[col] for col in agg_dict.keys()}
+                    
+                    unique_keys, aggregated = groupby_obj.groupby_aggregate(keys, values, agg_dict)
+                    
+                    result_data = {group_col: unique_keys}
+                    result_data.update(aggregated)
+                else:
+                    # Multi-column groupby
+                    keys = [self.frame.data[col] for col in self.by]
+                    values = {col: self.frame.data[col] for col in agg_dict.keys()}
+                    
+                    unique_key_dict, aggregated = groupby_obj.groupby_aggregate_multi_column(
+                        keys, self.by, values, agg_dict
+                    )
+                    
+                    result_data = unique_key_dict
+                    result_data.update(aggregated)
                 
                 return JaxFrame(result_data, index=None)
             
@@ -569,46 +613,62 @@ class JaxFrame:
         JaxFrame
             Merged DataFrame
         """
-        from ..distributed.parallel_algorithms import sort_merge_join
+        from ..distributed.parallel_algorithms import ParallelSortMergeJoin, ShardingSpec
+        from jax.sharding import Mesh
         
         # Handle single column name
         if isinstance(on, str):
             on = [on]
         
-        # For now, support single column joins
-        if len(on) > 1:
-            raise NotImplementedError("Multi-column joins not yet implemented")
+        # Validate join columns exist and check types
+        for col in on:
+            if col not in self.columns:
+                raise KeyError(f"Column '{col}' not found in left DataFrame")
+            if col not in other.columns:
+                raise KeyError(f"Column '{col}' not found in right DataFrame")
+            if self._dtypes[col] == 'object' or other._dtypes[col] == 'object':
+                raise TypeError(f"Cannot join on object dtype column '{col}'")
         
-        join_col = on[0]
+        # Create sharding spec
+        mesh = Mesh(jax.devices()[:1], axis_names=('devices',))
+        sharding_spec = ShardingSpec(mesh=mesh, row_sharding=False)
+        joiner = ParallelSortMergeJoin(sharding_spec)
         
-        # Validate join columns exist
-        if join_col not in self.columns:
-            raise KeyError(f"Column '{join_col}' not found in left DataFrame")
-        if join_col not in other.columns:
-            raise KeyError(f"Column '{join_col}' not found in right DataFrame")
+        # Prepare value dictionaries (excluding join keys)
+        left_values = {col: self.data[col] for col in self.columns if col not in on}
+        right_values = {col: other.data[col] for col in other.columns if col not in on}
         
-        # Check if join columns are numeric
-        if self._dtypes[join_col] == 'object' or other._dtypes[join_col] == 'object':
-            raise TypeError("Cannot join on object dtype columns with parallel join")
-        
-        # Prepare join keys and values
-        left_keys = self.data[join_col]
-        right_keys = other.data[join_col]
-        
-        # Prepare value dictionaries (excluding join key)
-        left_values = {col: self.data[col] for col in self.columns if col != join_col}
-        right_values = {col: other.data[col] for col in other.columns if col != join_col}
-        
-        # Perform parallel sort-merge join
-        joined_keys, joined_values = sort_merge_join(
-            left_keys, left_values,
-            right_keys, right_values,
-            how=how
-        )
-        
-        # Combine keys and values into result
-        result_data = {join_col: joined_keys}
-        result_data.update(joined_values)
+        if len(on) == 1:
+            # Single column join
+            join_col = on[0]
+            left_keys = self.data[join_col]
+            right_keys = other.data[join_col]
+            
+            # Perform parallel sort-merge join
+            joined_keys, joined_values = joiner.join(
+                left_keys, left_values,
+                right_keys, right_values,
+                how=how
+            )
+            
+            # Combine keys and values into result
+            result_data = {join_col: joined_keys}
+            result_data.update(joined_values)
+        else:
+            # Multi-column join
+            left_keys = [self.data[col] for col in on]
+            right_keys = [other.data[col] for col in on]
+            
+            # Perform multi-column join
+            joined_key_dict, joined_values = joiner.join_multi_column(
+                left_keys, on, left_values,
+                right_keys, on, right_values,
+                how=how
+            )
+            
+            # Combine keys and values into result
+            result_data = joined_key_dict
+            result_data.update(joined_values)
         
         return JaxFrame(result_data, index=None)
 
