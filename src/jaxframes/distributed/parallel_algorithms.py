@@ -572,37 +572,38 @@ class SortBasedGroupBy:
         segment_ids = jnp.cumsum(is_new_group) - 1
         
         # Apply aggregations
+        # Use scatter-based aggregation that works in sharded contexts
         aggregated_values = {}
         for col_name, agg_func in agg_funcs.items():
             sorted_vals = values[col_name][indices]
-            # Use segment-based aggregation
-            # Compute num_segments explicitly to avoid sharding issues
-            # Use the maximum segment ID + 1
-            n_segs = jnp.max(segment_ids) + 1
+            
+            # Get the maximum segment ID to determine output size
+            max_seg_id = jnp.max(segment_ids)
+            output_size = max_seg_id + 1
+            
             if agg_func == 'sum':
-                aggregated = jax.ops.segment_sum(
-                    sorted_vals, segment_ids, num_segments=n_segs
-                )
+                # Use scatter_add which doesn't require concrete num_segments
+                aggregated = jnp.zeros(output_size).at[segment_ids].add(sorted_vals)
+                
             elif agg_func == 'mean':
-                sums = jax.ops.segment_sum(
-                    sorted_vals, segment_ids, num_segments=n_segs
-                )
-                counts = jax.ops.segment_sum(
-                    jnp.ones_like(sorted_vals), segment_ids, num_segments=n_segs
-                )
+                # Sum values and counts using scatter
+                sums = jnp.zeros(output_size).at[segment_ids].add(sorted_vals)
+                counts = jnp.zeros(output_size).at[segment_ids].add(jnp.ones_like(sorted_vals))
                 aggregated = sums / jnp.maximum(counts, 1)
+                
             elif agg_func == 'max':
-                aggregated = jax.ops.segment_max(
-                    sorted_vals, segment_ids, num_segments=n_segs
-                )
+                # Use scatter_max
+                init_val = jnp.full(output_size, -jnp.inf)
+                aggregated = init_val.at[segment_ids].max(sorted_vals)
+                
             elif agg_func == 'min':
-                aggregated = jax.ops.segment_min(
-                    sorted_vals, segment_ids, num_segments=n_segs
-                )
+                # Use scatter_min
+                init_val = jnp.full(output_size, jnp.inf)
+                aggregated = init_val.at[segment_ids].min(sorted_vals)
+                
             elif agg_func == 'count':
-                aggregated = jax.ops.segment_sum(
-                    jnp.ones_like(sorted_vals), segment_ids, num_segments=n_segs
-                )
+                # Count using scatter_add with ones
+                aggregated = jnp.zeros(output_size).at[segment_ids].add(jnp.ones_like(sorted_vals))
             else:
                 raise ValueError(f"Unsupported aggregation: {agg_func}")
             
