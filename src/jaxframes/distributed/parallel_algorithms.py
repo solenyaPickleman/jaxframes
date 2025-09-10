@@ -576,30 +576,32 @@ class SortBasedGroupBy:
         for col_name, agg_func in agg_funcs.items():
             sorted_vals = values[col_name][indices]
             # Use segment-based aggregation
-            # Let JAX infer num_segments when in JIT/sharded context
+            # Compute num_segments explicitly to avoid sharding issues
+            # Use the maximum segment ID + 1
+            n_segs = jnp.max(segment_ids) + 1
             if agg_func == 'sum':
                 aggregated = jax.ops.segment_sum(
-                    sorted_vals, segment_ids, num_segments=None
+                    sorted_vals, segment_ids, num_segments=n_segs
                 )
             elif agg_func == 'mean':
                 sums = jax.ops.segment_sum(
-                    sorted_vals, segment_ids, num_segments=None
+                    sorted_vals, segment_ids, num_segments=n_segs
                 )
                 counts = jax.ops.segment_sum(
-                    jnp.ones_like(sorted_vals), segment_ids, num_segments=None
+                    jnp.ones_like(sorted_vals), segment_ids, num_segments=n_segs
                 )
                 aggregated = sums / jnp.maximum(counts, 1)
             elif agg_func == 'max':
                 aggregated = jax.ops.segment_max(
-                    sorted_vals, segment_ids, num_segments=None
+                    sorted_vals, segment_ids, num_segments=n_segs
                 )
             elif agg_func == 'min':
                 aggregated = jax.ops.segment_min(
-                    sorted_vals, segment_ids, num_segments=None
+                    sorted_vals, segment_ids, num_segments=n_segs
                 )
             elif agg_func == 'count':
                 aggregated = jax.ops.segment_sum(
-                    jnp.ones_like(sorted_vals), segment_ids, num_segments=None
+                    jnp.ones_like(sorted_vals), segment_ids, num_segments=n_segs
                 )
             else:
                 raise ValueError(f"Unsupported aggregation: {agg_func}")
