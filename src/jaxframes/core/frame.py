@@ -531,13 +531,7 @@ class JaxFrame:
                         raise TypeError(f"Cannot group by object dtype column '{col}'")
             
             def agg(self, agg_funcs):
-                from ..distributed.parallel_algorithms import SortBasedGroupBy, ShardingSpec
-                from jax.sharding import Mesh
-                
-                # Create sharding spec
-                mesh = Mesh(jax.devices()[:1], axis_names=('devices',))
-                sharding_spec = ShardingSpec(mesh=mesh, row_sharding=False)
-                groupby_obj = SortBasedGroupBy(sharding_spec)
+                from ..distributed import parallel_algorithms
                 
                 # Prepare aggregation functions
                 if isinstance(agg_funcs, str):
@@ -550,38 +544,30 @@ class JaxFrame:
                 
                 # Prepare keys and values
                 if len(self.by) == 1:
-                    # Single column groupby
+                    # Single column groupby - use wrapper function
                     group_col = self.by[0]
                     keys = self.frame.data[group_col]
                     values = {col: self.frame.data[col] for col in agg_dict.keys()}
                     
-                    unique_keys, aggregated = groupby_obj.groupby_aggregate(keys, values, agg_dict)
+                    # Use the wrapper function that handles cleanup
+                    unique_keys, aggregated = parallel_algorithms.groupby_aggregate(
+                        keys, values, agg_dict
+                    )
                     
                     result_data = {group_col: unique_keys}
                     result_data.update(aggregated)
                 else:
-                    # Multi-column groupby
+                    # Multi-column groupby - use wrapper function
                     keys = [self.frame.data[col] for col in self.by]
                     values = {col: self.frame.data[col] for col in agg_dict.keys()}
                     
-                    unique_key_dict, aggregated = groupby_obj.groupby_aggregate_multi_column(
+                    # Use the wrapper function that handles cleanup
+                    unique_key_dict, aggregated = parallel_algorithms.groupby_aggregate_multi_column(
                         keys, self.by, values, agg_dict
                     )
                     
-                    # Clean up NaN padding from multi-column results
-                    # Use the first key to determine valid rows
-                    first_key = unique_key_dict[self.by[0]]
-                    valid_mask = ~jnp.isnan(first_key)
-                    num_valid = jnp.sum(valid_mask)
-                    
-                    # Filter unique keys
-                    result_data = {}
-                    for key_name, key_vals in unique_key_dict.items():
-                        result_data[key_name] = key_vals[valid_mask]
-                    
-                    # Aggregated values are compact at the beginning
-                    for col, vals in aggregated.items():
-                        result_data[col] = vals[:num_valid]
+                    result_data = unique_key_dict
+                    result_data.update(aggregated)
                 
                 return JaxFrame(result_data, index=None)
             

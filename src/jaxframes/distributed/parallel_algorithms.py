@@ -1131,6 +1131,45 @@ def groupby_aggregate(
     return unique_keys, aggregated
 
 
+def groupby_aggregate_multi_column(
+    keys: List[Array],
+    key_names: List[str],
+    values: Dict[str, Array],
+    agg_funcs: Dict[str, str],
+    sharding_spec: Optional[ShardingSpec] = None
+) -> Tuple[Dict[str, Array], Dict[str, Array]]:
+    """
+    Perform multi-column groupby aggregation with cleanup.
+    
+    This is a wrapper that handles padding cleanup for user-facing API.
+    """
+    if sharding_spec is None:
+        from .sharding import ShardingSpec
+        mesh = Mesh(jax.devices()[:1], axis_names=('devices',))
+        sharding_spec = ShardingSpec(mesh=mesh, row_sharding=False)
+        
+    groupby = SortBasedGroupBy(sharding_spec)
+    unique_key_dict, aggregated = groupby.groupby_aggregate_multi_column(
+        keys, key_names, values, agg_funcs
+    )
+    
+    # Clean up NaN padding from multi-column results
+    # Use the first key to determine valid rows
+    first_key = unique_key_dict[key_names[0]]
+    valid_mask = ~jnp.isnan(first_key)
+    num_valid = jnp.sum(valid_mask)
+    
+    # Filter unique keys
+    cleaned_keys = {}
+    for key_name, key_vals in unique_key_dict.items():
+        cleaned_keys[key_name] = key_vals[valid_mask]
+    
+    # Aggregated values are compact at the beginning
+    cleaned_agg = {col: vals[:num_valid] for col, vals in aggregated.items()}
+    
+    return cleaned_keys, cleaned_agg
+
+
 def sort_merge_join(
     left_keys: Array,
     left_values: Dict[str, Array],
