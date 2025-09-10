@@ -561,7 +561,7 @@ class SortBasedGroupBy:
         
         # Get unique key values
         # In JIT context, use masking approach
-        num_segments = int(jnp.sum(is_new_group))  # Count of unique groups (must be concrete)
+        num_segments = jnp.sum(is_new_group)  # Count of unique groups
         unique_keys = {}
         for i, key_name in enumerate(key_names):
             sorted_key = keys[i][indices]
@@ -576,29 +576,30 @@ class SortBasedGroupBy:
         for col_name, agg_func in agg_funcs.items():
             sorted_vals = values[col_name][indices]
             # Use segment-based aggregation
+            # Let JAX infer num_segments when in JIT/sharded context
             if agg_func == 'sum':
                 aggregated = jax.ops.segment_sum(
-                    sorted_vals, segment_ids, num_segments
+                    sorted_vals, segment_ids, num_segments=None
                 )
             elif agg_func == 'mean':
                 sums = jax.ops.segment_sum(
-                    sorted_vals, segment_ids, num_segments
+                    sorted_vals, segment_ids, num_segments=None
                 )
                 counts = jax.ops.segment_sum(
-                    jnp.ones_like(sorted_vals), segment_ids, num_segments
+                    jnp.ones_like(sorted_vals), segment_ids, num_segments=None
                 )
                 aggregated = sums / jnp.maximum(counts, 1)
             elif agg_func == 'max':
                 aggregated = jax.ops.segment_max(
-                    sorted_vals, segment_ids, num_segments
+                    sorted_vals, segment_ids, num_segments=None
                 )
             elif agg_func == 'min':
                 aggregated = jax.ops.segment_min(
-                    sorted_vals, segment_ids, num_segments
+                    sorted_vals, segment_ids, num_segments=None
                 )
             elif agg_func == 'count':
                 aggregated = jax.ops.segment_sum(
-                    jnp.ones_like(sorted_vals), segment_ids, num_segments
+                    jnp.ones_like(sorted_vals), segment_ids, num_segments=None
                 )
             else:
                 raise ValueError(f"Unsupported aggregation: {agg_func}")
@@ -606,7 +607,9 @@ class SortBasedGroupBy:
             # Extend to full size with NaN padding for consistency
             full_size = len(keys[0])
             padded = jnp.full(full_size, jnp.nan)
-            padded = padded.at[:num_segments].set(aggregated)
+            # Use the actual length of aggregated results
+            agg_len = len(aggregated)
+            padded = padded.at[:agg_len].set(aggregated)
             aggregated_values[col_name] = padded
         
         # For the final result, we need to filter out the NaN values
