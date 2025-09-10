@@ -561,7 +561,7 @@ class SortBasedGroupBy:
         
         # Get unique key values
         # In JIT context, use masking approach
-        num_segments = jnp.sum(is_new_group)  # Count of unique groups
+        num_segments = int(jnp.sum(is_new_group))  # Count of unique groups (must be concrete)
         unique_keys = {}
         for i, key_name in enumerate(key_names):
             sorted_key = keys[i][indices]
