@@ -61,29 +61,61 @@ def distributed_reduction(
     
     # Multi-device case - use pmap with collective operations
     def parallel_reduce(local_array):
-        # First do local reduction
-        if op == 'sum':
-            local_result = jnp.sum(local_array, axis=axis, keepdims=keepdims)
-            return psum(local_result, axis_name='devices')
-        elif op == 'mean':
-            local_sum = jnp.sum(local_array, axis=axis, keepdims=keepdims)
-            local_count = jnp.sum(jnp.ones_like(local_array), axis=axis, keepdims=keepdims)
-            global_sum = psum(local_sum, axis_name='devices')
-            global_count = psum(local_count, axis_name='devices')
-            return global_sum / jnp.maximum(global_count, 1)
-        elif op == 'max':
-            local_result = jnp.max(local_array, axis=axis, keepdims=keepdims)
-            return pmax(local_result, axis_name='devices')
-        elif op == 'min':
-            local_result = jnp.min(local_array, axis=axis, keepdims=keepdims)
-            return pmin(local_result, axis_name='devices')
-        elif op == 'prod':
-            local_result = jnp.prod(local_array, axis=axis, keepdims=keepdims)
-            # Note: JAX doesn't have pprod, so we'd need to implement it
-            # For now, just gather and multiply
-            return local_result
+        # Handle NaN padding for floating point types
+        if jnp.issubdtype(local_array.dtype, jnp.floating):
+            # Use nan-safe operations for floating point types
+            if op == 'sum':
+                local_result = jnp.nansum(local_array, axis=axis, keepdims=keepdims)
+                return psum(local_result, axis_name='devices')
+            elif op == 'mean':
+                local_sum = jnp.nansum(local_array, axis=axis, keepdims=keepdims)
+                # Count non-NaN values
+                local_count = jnp.sum(~jnp.isnan(local_array), axis=axis, keepdims=keepdims, dtype=jnp.float32)
+                global_sum = psum(local_sum, axis_name='devices')
+                global_count = psum(local_count, axis_name='devices')
+                return global_sum / jnp.maximum(global_count, 1)
+            elif op == 'max':
+                local_result = jnp.nanmax(local_array, axis=axis, keepdims=keepdims)
+                return pmax(local_result, axis_name='devices')
+            elif op == 'min':
+                local_result = jnp.nanmin(local_array, axis=axis, keepdims=keepdims)
+                return pmin(local_result, axis_name='devices')
+            elif op == 'prod':
+                local_result = jnp.nanprod(local_array, axis=axis, keepdims=keepdims)
+                # Note: JAX doesn't have pprod, so we'd need to implement it
+                # For now, just gather and multiply
+                return local_result
+            else:
+                raise ValueError(f"Unsupported reduction operation: {op}")
         else:
-            raise ValueError(f"Unsupported reduction operation: {op}")
+            # For integer types, handle the sentinel value -999999
+            if op == 'sum':
+                mask = local_array != -999999
+                local_result = jnp.sum(jnp.where(mask, local_array, 0), axis=axis, keepdims=keepdims)
+                return psum(local_result, axis_name='devices')
+            elif op == 'mean':
+                mask = local_array != -999999
+                local_sum = jnp.sum(jnp.where(mask, local_array, 0), axis=axis, keepdims=keepdims)
+                local_count = jnp.sum(mask, axis=axis, keepdims=keepdims, dtype=jnp.float32)
+                global_sum = psum(local_sum, axis_name='devices')
+                global_count = psum(local_count, axis_name='devices')
+                return global_sum / jnp.maximum(global_count, 1)
+            elif op == 'max':
+                mask = local_array != -999999
+                local_result = jnp.max(jnp.where(mask, local_array, jnp.iinfo(local_array.dtype).min), axis=axis, keepdims=keepdims)
+                return pmax(local_result, axis_name='devices')
+            elif op == 'min':
+                mask = local_array != -999999
+                local_result = jnp.min(jnp.where(mask, local_array, jnp.iinfo(local_array.dtype).max), axis=axis, keepdims=keepdims)
+                return pmin(local_result, axis_name='devices')
+            elif op == 'prod':
+                mask = local_array != -999999
+                local_result = jnp.prod(jnp.where(mask, local_array, 1), axis=axis, keepdims=keepdims)
+                # Note: JAX doesn't have pprod, so we'd need to implement it
+                # For now, just gather and multiply
+                return local_result
+            else:
+                raise ValueError(f"Unsupported reduction operation: {op}")
     
     # Apply pmap for parallel reduction
     if sharding_spec.mesh.size > 1:
