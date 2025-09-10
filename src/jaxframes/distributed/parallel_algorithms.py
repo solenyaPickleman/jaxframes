@@ -560,24 +560,54 @@ class SortBasedGroupBy:
             is_new_group = is_new_group.at[1:].set(is_new_group[1:] | key_changes)
         
         # Get unique key values
+        # Use compress to get actual unique values
         unique_keys = {}
         for i, key_name in enumerate(key_names):
             sorted_key = keys[i][indices]
-            unique_keys[key_name] = sorted_key[is_new_group]
+            # Extract only the unique values (where is_new_group is True)
+            unique_keys[key_name] = jnp.compress(is_new_group, sorted_key)
         
         # Create segment IDs for aggregation
         segment_ids = jnp.cumsum(is_new_group) - 1
-        num_segments = segment_ids[-1] + 1
+        num_segments = jnp.sum(is_new_group)  # Count of unique groups
         
         # Apply aggregations
         aggregated_values = {}
         for col_name, agg_func in agg_funcs.items():
             sorted_vals = values[col_name][indices]
-            aggregated = self._apply_aggregation_vectorized(
-                sorted_vals, segment_ids, agg_func, num_segments
-            )
+            # Use segment-based aggregation
+            if agg_func == 'sum':
+                aggregated = jax.ops.segment_sum(
+                    sorted_vals, segment_ids, num_segments
+                )
+            elif agg_func == 'mean':
+                sums = jax.ops.segment_sum(
+                    sorted_vals, segment_ids, num_segments
+                )
+                counts = jax.ops.segment_sum(
+                    jnp.ones_like(sorted_vals), segment_ids, num_segments
+                )
+                aggregated = sums / jnp.maximum(counts, 1)
+            elif agg_func == 'max':
+                aggregated = jax.ops.segment_max(
+                    sorted_vals, segment_ids, num_segments
+                )
+            elif agg_func == 'min':
+                aggregated = jax.ops.segment_min(
+                    sorted_vals, segment_ids, num_segments
+                )
+            elif agg_func == 'count':
+                aggregated = jax.ops.segment_sum(
+                    jnp.ones_like(sorted_vals), segment_ids, num_segments
+                )
+            else:
+                raise ValueError(f"Unsupported aggregation: {agg_func}")
+            
             aggregated_values[col_name] = aggregated
         
+        # For the final result, we need to filter out the NaN values
+        # But in a JIT-compatible way, we return masked arrays
+        # The caller can handle filtering if needed
         return unique_keys, aggregated_values
 
     def groupby_aggregate(
@@ -616,8 +646,9 @@ class SortBasedGroupBy:
             sorted_keys[1:] != sorted_keys[:-1]
         ])
         
-        # Get unique keys
-        unique_keys = sorted_keys[is_boundary]
+        # Get unique keys - use compress for actual unique values
+        num_groups = jnp.sum(is_boundary)
+        unique_keys = jnp.compress(is_boundary, sorted_keys)
         
         # Create segment IDs for segmented operations
         segment_ids = jnp.cumsum(is_boundary) - 1
@@ -634,7 +665,7 @@ class SortBasedGroupBy:
                 
                 # Apply aggregation using helper method
                 aggregated = self._apply_aggregation_vectorized(
-                    sorted_vals, segment_ids, agg_func, unique_keys.shape[0]
+                    sorted_vals, segment_ids, agg_func, num_groups
                 )
                 
                 aggregated_values[col_name] = aggregated
@@ -643,7 +674,7 @@ class SortBasedGroupBy:
             for col_name, agg_func in agg_funcs.items():
                 sorted_vals = values[col_name][sorted_indices]
                 aggregated = self._apply_aggregation_vectorized(
-                    sorted_vals, segment_ids, agg_func, unique_keys.shape[0]
+                    sorted_vals, segment_ids, agg_func, num_groups
                 )
                 aggregated_values[col_name] = aggregated
             

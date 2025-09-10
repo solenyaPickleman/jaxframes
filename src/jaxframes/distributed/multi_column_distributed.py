@@ -87,15 +87,18 @@ class DistributedMultiColumnOps:
         
         # Apply distributed sort
         with self.mesh:
+            # Create sharding specification
+            sharding = NamedSharding(self.mesh, P('devices'))
+            
             # Shard the data across devices
             sharded_keys = [
-                NamedSharding(self.mesh, P('devices'))(key) 
+                jax.device_put(key, sharding)
                 for key in keys
             ]
             sharded_values = None
             if values is not None:
                 sharded_values = {
-                    col: NamedSharding(self.mesh, P('devices'))(arr)
+                    col: jax.device_put(arr, sharding)
                     for col, arr in values.items()
                 }
             
