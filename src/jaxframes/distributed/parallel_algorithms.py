@@ -560,16 +560,18 @@ class SortBasedGroupBy:
             is_new_group = is_new_group.at[1:].set(is_new_group[1:] | key_changes)
         
         # Get unique key values
-        # Use compress to get actual unique values
+        # In JIT context, we need to handle dynamic shapes carefully
+        num_segments = jnp.sum(is_new_group)  # Count of unique groups
         unique_keys = {}
         for i, key_name in enumerate(key_names):
             sorted_key = keys[i][indices]
-            # Extract only the unique values (where is_new_group is True)
-            unique_keys[key_name] = jnp.compress(is_new_group, sorted_key)
+            # Use compress with explicit size for JIT compatibility
+            unique_keys[key_name] = jnp.compress(
+                is_new_group, sorted_key, size=len(keys[0])
+            )[:num_segments]
         
         # Create segment IDs for aggregation
         segment_ids = jnp.cumsum(is_new_group) - 1
-        num_segments = jnp.sum(is_new_group)  # Count of unique groups
         
         # Apply aggregations
         aggregated_values = {}
@@ -646,9 +648,11 @@ class SortBasedGroupBy:
             sorted_keys[1:] != sorted_keys[:-1]
         ])
         
-        # Get unique keys - use compress for actual unique values
+        # Get unique keys - use compress with size for JIT compatibility
         num_groups = jnp.sum(is_boundary)
-        unique_keys = jnp.compress(is_boundary, sorted_keys)
+        unique_keys = jnp.compress(
+            is_boundary, sorted_keys, size=len(sorted_keys)
+        )[:num_groups]
         
         # Create segment IDs for segmented operations
         segment_ids = jnp.cumsum(is_boundary) - 1

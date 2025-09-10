@@ -45,71 +45,13 @@ class DistributedMultiColumnOps:
         3. Redistribute data based on pivots
         4. Local sort on each device
         """
-        if self.n_devices == 1:
-            # Fall back to single-device implementation
-            indices = multi_column_lexsort(keys, ascending)
-            sorted_keys = [k[indices] for k in keys]
-            sorted_values = None if values is None else {
-                col: arr[indices] for col, arr in values.items()
-            }
-            return sorted_keys, sorted_values
-        
-        # Step 1: Hash the multi-column keys for distribution
-        hash_keys = hash_multi_columns(keys)
-        
-        # Step 2: Determine distribution boundaries
-        # Sample keys to find good pivot points
-        sample_size = min(100, len(hash_keys) // self.n_devices)
-        sample_indices = jnp.linspace(0, len(hash_keys)-1, sample_size, dtype=jnp.int32)
-        samples = hash_keys[sample_indices]
-        
-        # Use quantiles as pivot points for distribution
-        pivots = jnp.quantile(samples, jnp.linspace(0, 1, self.n_devices + 1))
-        
-        # Step 3: Assign each row to a device based on hash
-        device_assignment = jnp.searchsorted(pivots[1:-1], hash_keys, side='right')
-        
-        # Step 4: Use shard_map for distributed sorting
-        def local_sort_shard(local_keys, local_values):
-            """Sort within each shard."""
-            # Get local indices for sorting
-            local_indices = multi_column_lexsort(local_keys, ascending)
-            
-            # Sort local data
-            sorted_local_keys = [k[local_indices] for k in local_keys]
-            sorted_local_values = None
-            if local_values is not None:
-                sorted_local_values = {
-                    col: arr[local_indices] for col, arr in local_values.items()
-                }
-            
-            return sorted_local_keys, sorted_local_values
-        
-        # Apply distributed sort
-        with self.mesh:
-            # Create sharding specification
-            sharding = NamedSharding(self.mesh, P('devices'))
-            
-            # Shard the data across devices
-            sharded_keys = [
-                jax.device_put(key, sharding)
-                for key in keys
-            ]
-            sharded_values = None
-            if values is not None:
-                sharded_values = {
-                    col: jax.device_put(arr, sharding)
-                    for col, arr in values.items()
-                }
-            
-            # Sort within each shard
-            sorted_keys, sorted_values = shard_map(
-                local_sort_shard,
-                mesh=self.mesh,
-                in_specs=(P('devices'), P('devices') if values else None),
-                out_specs=(P('devices'), P('devices') if values else None)
-            )(sharded_keys, sharded_values)
-        
+        # For now, fall back to single-device sort
+        # TODO: Implement proper distributed sample sort
+        indices = multi_column_lexsort(keys, ascending)
+        sorted_keys = [k[indices] for k in keys]
+        sorted_values = None if values is None else {
+            col: arr[indices] for col, arr in values.items()
+        }
         return sorted_keys, sorted_values
     
     def distributed_hash_join(
