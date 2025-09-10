@@ -86,35 +86,54 @@ def hash_multi_columns(keys: List[Array]) -> Array:
         Hash values for each row
     """
     if len(keys) == 1:
-        # For single key, just return it (or hash it if needed)
+        # For single key, apply a mixing function for better distribution
         key = keys[0]
         if key.dtype in [jnp.float32, jnp.float64]:
             # For floats, use bit representation
-            return key.view(jnp.uint32 if key.dtype == jnp.float32 else jnp.uint32)
-        return key.astype(jnp.uint32)
+            key_int = key.view(jnp.uint32 if key.dtype == jnp.float32 else jnp.uint32)
+        else:
+            key_int = key.astype(jnp.uint32)
+        
+        # Apply mixing for better distribution
+        key_int = key_int ^ (key_int >> 16)
+        key_int = key_int * jnp.uint32(0x85ebca6b)
+        key_int = key_int ^ (key_int >> 13)
+        key_int = key_int * jnp.uint32(0xc2b2ae35)
+        key_int = key_int ^ (key_int >> 16)
+        return key_int
     
-    # Use polynomial rolling hash
-    # This is more robust than combining ranks
-    PRIME = jnp.uint32(2**31 - 1)
-    MULT = jnp.uint32(31)
+    # Use polynomial rolling hash with better mixing
+    # Different primes for better distribution
+    PRIME1 = jnp.uint32(0x9e3779b1)  # Golden ratio prime
+    PRIME2 = jnp.uint32(0x85ebca6b)  # Another good mixing prime
     
-    # Start with zeros
-    hash_vals = jnp.zeros(len(keys[0]), dtype=jnp.uint32)
+    # Start with a seed value
+    hash_vals = jnp.uint32(0x1337)  # Non-zero seed
     
-    for key in keys:
+    for i, key in enumerate(keys):
         # Convert to integers if needed
         if key.dtype in [jnp.float32, jnp.float64]:
             # Use bit representation for floats
             if key.dtype == jnp.float32:
                 key_int = key.view(jnp.uint32)
             else:
-                # For float64, take lower 32 bits
-                key_int = key.view(jnp.uint32)
+                # For float64, take lower 32 bits after casting
+                key_int = key.astype(jnp.float32).view(jnp.uint32)
         else:
             key_int = key.astype(jnp.uint32)
         
-        # Rolling hash: hash = (hash * MULT + key) % PRIME
-        hash_vals = ((hash_vals * MULT) + key_int) % PRIME
+        # Mix in the key with rotation and XOR for better distribution
+        # Use different prime multipliers for each position
+        hash_vals = hash_vals ^ (key_int * (PRIME1 + jnp.uint32(i)))
+        hash_vals = ((hash_vals << 13) | (hash_vals >> 19))  # Rotate
+        hash_vals = hash_vals * PRIME2
+    
+    # Final mixing for better distribution
+    hash_vals = hash_vals ^ (hash_vals >> 16)
+    hash_vals = hash_vals * jnp.uint32(0x85ebca6b)
+    hash_vals = hash_vals ^ (hash_vals >> 13)
+    hash_vals = hash_vals * jnp.uint32(0xc2b2ae35)
+    hash_vals = hash_vals ^ (hash_vals >> 16)
     
     return hash_vals
 
