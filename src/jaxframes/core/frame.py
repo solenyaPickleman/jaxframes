@@ -568,8 +568,20 @@ class JaxFrame:
                         keys, self.by, values, agg_dict
                     )
                     
-                    result_data = unique_key_dict
-                    result_data.update(aggregated)
+                    # Clean up NaN padding from multi-column results
+                    # Use the first key to determine valid rows
+                    first_key = unique_key_dict[self.by[0]]
+                    valid_mask = ~jnp.isnan(first_key)
+                    num_valid = jnp.sum(valid_mask)
+                    
+                    # Filter unique keys
+                    result_data = {}
+                    for key_name, key_vals in unique_key_dict.items():
+                        result_data[key_name] = key_vals[valid_mask]
+                    
+                    # Aggregated values are compact at the beginning
+                    for col, vals in aggregated.items():
+                        result_data[col] = vals[:num_valid]
                 
                 return JaxFrame(result_data, index=None)
             

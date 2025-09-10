@@ -560,15 +560,13 @@ class SortBasedGroupBy:
             is_new_group = is_new_group.at[1:].set(is_new_group[1:] | key_changes)
         
         # Get unique key values
-        # In JIT context, we need to handle dynamic shapes carefully
+        # In JIT context, use masking approach
         num_segments = jnp.sum(is_new_group)  # Count of unique groups
         unique_keys = {}
         for i, key_name in enumerate(key_names):
             sorted_key = keys[i][indices]
-            # Use compress with explicit size for JIT compatibility
-            unique_keys[key_name] = jnp.compress(
-                is_new_group, sorted_key, size=len(keys[0])
-            )[:num_segments]
+            # Use where to create masked array (NaN for non-unique)
+            unique_keys[key_name] = jnp.where(is_new_group, sorted_key, jnp.nan)
         
         # Create segment IDs for aggregation
         segment_ids = jnp.cumsum(is_new_group) - 1
@@ -605,10 +603,14 @@ class SortBasedGroupBy:
             else:
                 raise ValueError(f"Unsupported aggregation: {agg_func}")
             
-            aggregated_values[col_name] = aggregated
+            # Extend to full size with NaN padding for consistency
+            full_size = len(keys[0])
+            padded = jnp.full(full_size, jnp.nan)
+            padded = padded.at[:num_segments].set(aggregated)
+            aggregated_values[col_name] = padded
         
         # For the final result, we need to filter out the NaN values
-        # But in a JIT-compatible way, we return masked arrays
+        # But in a JIT-compatible way, we return padded arrays
         # The caller can handle filtering if needed
         return unique_keys, aggregated_values
 
@@ -648,11 +650,10 @@ class SortBasedGroupBy:
             sorted_keys[1:] != sorted_keys[:-1]
         ])
         
-        # Get unique keys - use compress with size for JIT compatibility
+        # Get unique keys - use masking for JIT compatibility
         num_groups = jnp.sum(is_boundary)
-        unique_keys = jnp.compress(
-            is_boundary, sorted_keys, size=len(sorted_keys)
-        )[:num_groups]
+        # Use where to create masked array
+        unique_keys = jnp.where(is_boundary, sorted_keys, jnp.nan)
         
         # Create segment IDs for segmented operations
         segment_ids = jnp.cumsum(is_boundary) - 1
@@ -671,8 +672,11 @@ class SortBasedGroupBy:
                 aggregated = self._apply_aggregation_vectorized(
                     sorted_vals, segment_ids, agg_func, num_groups
                 )
-                
-                aggregated_values[col_name] = aggregated
+                # Extend to full size with NaN padding
+                full_size = len(sorted_keys)
+                padded = jnp.full(full_size, jnp.nan)
+                padded = padded.at[:num_groups].set(aggregated)
+                aggregated_values[col_name] = padded
         else:
             # Single column - process directly
             for col_name, agg_func in agg_funcs.items():
@@ -680,7 +684,11 @@ class SortBasedGroupBy:
                 aggregated = self._apply_aggregation_vectorized(
                     sorted_vals, segment_ids, agg_func, num_groups
                 )
-                aggregated_values[col_name] = aggregated
+                # Extend to full size with NaN padding
+                full_size = len(sorted_keys)
+                padded = jnp.full(full_size, jnp.nan)
+                padded = padded.at[:num_groups].set(aggregated)
+                aggregated_values[col_name] = padded
             
         return unique_keys, aggregated_values
 
@@ -1108,7 +1116,19 @@ def groupby_aggregate(
         sharding_spec = ShardingSpec(mesh=mesh, row_sharding=False)
         
     groupby = SortBasedGroupBy(sharding_spec)
-    return groupby.groupby_aggregate(keys, values, agg_funcs)
+    unique_keys, aggregated = groupby.groupby_aggregate(keys, values, agg_funcs)
+    
+    # Clean up padding for user-facing API
+    # The unique_keys have NaN where not unique, aggregated values are padded at the end
+    valid_mask = ~jnp.isnan(unique_keys)
+    unique_keys = unique_keys[valid_mask]
+    
+    # For aggregated values, they are compact at the beginning
+    # Count how many valid unique keys we have
+    num_valid = jnp.sum(valid_mask)
+    aggregated = {col: vals[:num_valid] for col, vals in aggregated.items()}
+    
+    return unique_keys, aggregated
 
 
 def sort_merge_join(
