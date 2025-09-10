@@ -572,48 +572,47 @@ class SortBasedGroupBy:
         segment_ids = jnp.cumsum(is_new_group) - 1
         
         # Apply aggregations
-        # Use scatter-based aggregation that works in sharded contexts
+        # Use fixed-size scatter operations that work in sharded contexts
         aggregated_values = {}
+        n = len(keys[0])  # Use input size as upper bound for output
+        
         for col_name, agg_func in agg_funcs.items():
             sorted_vals = values[col_name][indices]
             
-            # Get the maximum segment ID to determine output size
-            max_seg_id = jnp.max(segment_ids)
-            output_size = max_seg_id + 1
-            
+            # Use fixed size (input size) for scatter operations
+            # This avoids issues with traced/sharded sizes
             if agg_func == 'sum':
-                # Use scatter_add which doesn't require concrete num_segments
-                aggregated = jnp.zeros(output_size).at[segment_ids].add(sorted_vals)
+                # Use scatter_add with fixed size
+                aggregated = jnp.zeros(n).at[segment_ids].add(sorted_vals)
                 
             elif agg_func == 'mean':
                 # Sum values and counts using scatter
-                sums = jnp.zeros(output_size).at[segment_ids].add(sorted_vals)
-                counts = jnp.zeros(output_size).at[segment_ids].add(jnp.ones_like(sorted_vals))
+                sums = jnp.zeros(n).at[segment_ids].add(sorted_vals)
+                counts = jnp.zeros(n).at[segment_ids].add(jnp.ones_like(sorted_vals))
                 aggregated = sums / jnp.maximum(counts, 1)
                 
             elif agg_func == 'max':
-                # Use scatter_max
-                init_val = jnp.full(output_size, -jnp.inf)
+                # Use scatter_max with fixed size
+                init_val = jnp.full(n, -jnp.inf)
                 aggregated = init_val.at[segment_ids].max(sorted_vals)
                 
             elif agg_func == 'min':
-                # Use scatter_min
-                init_val = jnp.full(output_size, jnp.inf)
+                # Use scatter_min with fixed size
+                init_val = jnp.full(n, jnp.inf)
                 aggregated = init_val.at[segment_ids].min(sorted_vals)
                 
             elif agg_func == 'count':
                 # Count using scatter_add with ones
-                aggregated = jnp.zeros(output_size).at[segment_ids].add(jnp.ones_like(sorted_vals))
+                aggregated = jnp.zeros(n).at[segment_ids].add(jnp.ones_like(sorted_vals))
             else:
                 raise ValueError(f"Unsupported aggregation: {agg_func}")
             
-            # Extend to full size with NaN padding for consistency
-            full_size = len(keys[0])
-            padded = jnp.full(full_size, jnp.nan)
-            # Use the actual length of aggregated results
-            agg_len = len(aggregated)
-            padded = padded.at[:agg_len].set(aggregated)
-            aggregated_values[col_name] = padded
+            # The aggregated array already has size n (input size)
+            # Mark unused positions with NaN for consistency
+            # Only the first num_segments positions contain valid data
+            mask = jnp.arange(n) < num_segments
+            aggregated = jnp.where(mask, aggregated, jnp.nan)
+            aggregated_values[col_name] = aggregated
         
         # For the final result, we need to filter out the NaN values
         # But in a JIT-compatible way, we return padded arrays
