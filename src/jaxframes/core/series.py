@@ -1,6 +1,6 @@
 """JaxSeries: Series class for JaxFrames."""
 
-from typing import Optional, Any, Union
+from typing import Optional, Any, Union, TYPE_CHECKING
 import numpy as np
 import pandas as pd
 import jax
@@ -11,6 +11,11 @@ from .jit_utils import (
     auto_jit, get_binary_op, get_unary_op, get_reduction_op,
     is_jax_compatible, OperationChain
 )
+from ..lazy.expressions import Column, Literal, Expr
+from ..ops.comparison import ComparisonOp, ComparisonOpType
+
+if TYPE_CHECKING:
+    from .frame import JaxFrame
 
 
 class JaxSeries:
@@ -32,13 +37,50 @@ class JaxSeries:
         Data type for the series
     """
     
-    def __init__(self, data: Union[Array, np.ndarray, list], name: Optional[str] = None, 
-                 index: Optional[Any] = None, dtype: Optional[Any] = None):
-        """Initialize a JaxSeries."""
+    def __init__(self, data: Union[Array, np.ndarray, list, None] = None, name: Optional[str] = None,
+                 index: Optional[Any] = None, dtype: Optional[Any] = None,
+                 lazy: bool = False, parent_frame: Optional['JaxFrame'] = None,
+                 expr: Optional[Expr] = None):
+        """Initialize a JaxSeries.
+
+        Parameters
+        ----------
+        data : Union[Array, np.ndarray, list, None]
+            The series data (None if lazy mode)
+        name : str, optional
+            Name of the series
+        index : optional
+            Index for the series
+        dtype : optional
+            Data type for the series
+        lazy : bool, default False
+            If True, this is a lazy series representing an expression
+        parent_frame : JaxFrame, optional
+            The parent frame this series belongs to (for lazy mode)
+        expr : Expr, optional
+            The expression this series represents (for lazy mode)
+        """
+        self._lazy = lazy
+        self._parent_frame = parent_frame
+        self._expr = expr
+        self.name = name
+        self.index = index
+
+        # Lazy mode: minimal initialization
+        if lazy:
+            self.data = None
+            self._dtype = None
+            self._length = None
+            return
+
+        # Eager mode: process data
+        if data is None:
+            raise ValueError("data is required for eager mode")
+
         # Process data to handle both JAX arrays and object arrays
         if isinstance(data, list):
             data = np.array(data, dtype=dtype if dtype else None)
-        
+
         if isinstance(data, np.ndarray):
             if data.dtype == np.object_ or not self._is_jax_compatible(data):
                 # Keep as numpy object array for non-JAX types
@@ -52,9 +94,7 @@ class JaxSeries:
             # Already a JAX array
             self.data = data
             self._dtype = str(data.dtype)
-        
-        self.name = name
-        self.index = index
+
         self._length = len(self.data)
     
     @property
@@ -305,9 +345,168 @@ class JaxSeries:
     def chain_operations(self) -> OperationChain:
         """Create an operation chain for complex expressions."""
         return OperationChain(self.data)
-    
+
+    def _comparison_op(self, other, op_type: ComparisonOpType):
+        """Helper method for comparison operations."""
+        # Lazy mode: create ComparisonOp expression
+        if self._lazy:
+            # Get left expression
+            left_expr = self._expr if self._expr is not None else Column(self.name)
+
+            # Get right expression
+            if isinstance(other, JaxSeries):
+                if other._lazy:
+                    right_expr = other._expr if other._expr is not None else Column(other.name)
+                else:
+                    # Eager series in comparison - convert to literal array
+                    right_expr = Literal(other.data)
+            elif isinstance(other, (int, float, np.number)):
+                right_expr = Literal(other)
+            else:
+                return NotImplemented
+
+            # Create comparison expression
+            comp_expr = ComparisonOp(op=op_type, left=left_expr, right=right_expr)
+
+            # Return a new lazy series with the comparison expression
+            return JaxSeries(
+                data=None,
+                name=None,
+                lazy=True,
+                parent_frame=self._parent_frame,
+                expr=comp_expr
+            )
+
+        # Eager mode: execute immediately
+        if isinstance(other, JaxSeries):
+            result = self._apply_comparison(self.data, other.data, op_type)
+        elif isinstance(other, (int, float, np.number)):
+            result = self._apply_comparison(self.data, other, op_type)
+        else:
+            return NotImplemented
+
+        return JaxSeries(result, name=self.name)
+
+    def _apply_comparison(self, left, right, op_type: ComparisonOpType):
+        """Apply comparison operation in eager mode."""
+        if op_type == ComparisonOpType.GT:
+            return left > right
+        elif op_type == ComparisonOpType.LT:
+            return left < right
+        elif op_type == ComparisonOpType.GE:
+            return left >= right
+        elif op_type == ComparisonOpType.LE:
+            return left <= right
+        elif op_type == ComparisonOpType.EQ:
+            return left == right
+        elif op_type == ComparisonOpType.NE:
+            return left != right
+        else:
+            raise ValueError(f"Unknown comparison type: {op_type}")
+
+    def __gt__(self, other):
+        """Greater than comparison."""
+        return self._comparison_op(other, ComparisonOpType.GT)
+
+    def __lt__(self, other):
+        """Less than comparison."""
+        return self._comparison_op(other, ComparisonOpType.LT)
+
+    def __ge__(self, other):
+        """Greater than or equal comparison."""
+        return self._comparison_op(other, ComparisonOpType.GE)
+
+    def __le__(self, other):
+        """Less than or equal comparison."""
+        return self._comparison_op(other, ComparisonOpType.LE)
+
+    def __eq__(self, other):
+        """Equality comparison."""
+        return self._comparison_op(other, ComparisonOpType.EQ)
+
+    def __ne__(self, other):
+        """Not equal comparison."""
+        return self._comparison_op(other, ComparisonOpType.NE)
+
+    def __and__(self, other):
+        """Logical AND for compound conditions."""
+        # Both lazy mode
+        if self._lazy and isinstance(other, JaxSeries) and other._lazy:
+            from ..lazy.expressions import BinaryOp
+            left_expr = self._expr if self._expr is not None else Column(self.name)
+            right_expr = other._expr if other._expr is not None else Column(other.name)
+            and_expr = BinaryOp(left=left_expr, op='&', right=right_expr)
+            return JaxSeries(
+                data=None,
+                name=None,
+                lazy=True,
+                parent_frame=self._parent_frame,
+                expr=and_expr
+            )
+        # Eager mode
+        elif not self._lazy and not (isinstance(other, JaxSeries) and other._lazy):
+            if isinstance(other, JaxSeries):
+                result = self.data & other.data
+            else:
+                result = self.data & other
+            return JaxSeries(result, name=self.name)
+        else:
+            raise ValueError("Cannot mix lazy and eager series in logical operations")
+
+    def __or__(self, other):
+        """Logical OR for compound conditions."""
+        # Both lazy mode
+        if self._lazy and isinstance(other, JaxSeries) and other._lazy:
+            from ..lazy.expressions import BinaryOp
+            left_expr = self._expr if self._expr is not None else Column(self.name)
+            right_expr = other._expr if other._expr is not None else Column(other.name)
+            or_expr = BinaryOp(left=left_expr, op='|', right=right_expr)
+            return JaxSeries(
+                data=None,
+                name=None,
+                lazy=True,
+                parent_frame=self._parent_frame,
+                expr=or_expr
+            )
+        # Eager mode
+        elif not self._lazy and not (isinstance(other, JaxSeries) and other._lazy):
+            if isinstance(other, JaxSeries):
+                result = self.data | other.data
+            else:
+                result = self.data | other
+            return JaxSeries(result, name=self.name)
+        else:
+            raise ValueError("Cannot mix lazy and eager series in logical operations")
+
+    def __invert__(self):
+        """Logical NOT for negating conditions."""
+        if self._lazy:
+            from ..lazy.expressions import UnaryOp
+            operand_expr = self._expr if self._expr is not None else Column(self.name)
+            not_expr = UnaryOp(op='~', operand=operand_expr)
+            return JaxSeries(
+                data=None,
+                name=None,
+                lazy=True,
+                parent_frame=self._parent_frame,
+                expr=not_expr
+            )
+        else:
+            # Eager mode
+            result = ~self.data
+            return JaxSeries(result, name=self.name)
+
+    def __array__(self):
+        """Convert to numpy array for compatibility with numpy functions."""
+        if isinstance(self.data, (jax.Array, jnp.ndarray)):
+            return np.array(self.data)
+        else:
+            return self.data
+
     def __repr__(self) -> str:
         """Return string representation."""
+        if self._lazy:
+            return f"JaxSeries(lazy=True, name={self.name}, expr={self._expr})"
         return f"JaxSeries(length={self._length}, name={self.name}, dtype={self._dtype})"
 
 
