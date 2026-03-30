@@ -5,15 +5,18 @@ This module provides TPU/multi-device optimized implementations
 of multi-column operations using JAX collectives and sharding.
 """
 
-from typing import List, Dict, Tuple, Optional, Union
-import jax
-import jax.numpy as jnp
-from jax import Array
-from jax.sharding import NamedSharding, PartitionSpec as P, Mesh
-from jax.experimental.shard_map import shard_map
-from jax.lax import all_to_all, psum
 
-from .parallel_algorithms import hash_multi_columns, multi_column_lexsort
+import jax
+from jax import Array
+from jax.sharding import Mesh
+
+from .parallel_algorithms import (
+    ParallelSortMergeJoin,
+    SortBasedGroupBy,
+    collective_hash_repartition,
+    compact_repartitioned_rows,
+    multi_column_lexsort,
+)
 from .sharding import ShardingSpec
 
 
@@ -24,18 +27,18 @@ class DistributedMultiColumnOps:
     These implementations use JAX's collective operations for
     efficient multi-device execution on TPUs.
     """
-    
+
     def __init__(self, sharding_spec: ShardingSpec):
         self.sharding_spec = sharding_spec
         self.mesh = sharding_spec.mesh
         self.n_devices = self.mesh.size
-    
+
     def distributed_multi_column_sort(
         self,
-        keys: List[Array],
-        values: Optional[Dict[str, Array]] = None,
-        ascending: Union[bool, List[bool]] = True
-    ) -> Tuple[List[Array], Optional[Dict[str, Array]]]:
+        keys: list[Array],
+        values: dict[str, Array] | None = None,
+        ascending: bool | list[bool] = True
+    ) -> tuple[list[Array], dict[str, Array] | None]:
         """
         Distributed multi-column sort using sample-based partitioning.
         
@@ -53,15 +56,15 @@ class DistributedMultiColumnOps:
             col: arr[indices] for col, arr in values.items()
         }
         return sorted_keys, sorted_values
-    
+
     def distributed_hash_join(
         self,
-        left_keys: List[Array],
-        right_keys: List[Array],
-        left_values: Dict[str, Array],
-        right_values: Dict[str, Array],
+        left_keys: list[Array],
+        right_keys: list[Array],
+        left_values: dict[str, Array],
+        right_values: dict[str, Array],
         how: str = 'inner'
-    ) -> Tuple[Dict[str, Array], Dict[str, Array]]:
+    ) -> tuple[dict[str, Array], dict[str, Array]]:
         """
         Distributed hash join using redistribution by hash.
         
@@ -73,75 +76,45 @@ class DistributedMultiColumnOps:
         """
         if self.n_devices == 1:
             # Fall back to single-device broadcast join
-            from .parallel_algorithms import ParallelSortMergeJoin
             joiner = ParallelSortMergeJoin(self.sharding_spec)
             return joiner.join_multi_column(
                 left_keys, list(range(len(left_keys))), left_values,
                 right_keys, list(range(len(right_keys))), right_values,
                 how
             )
-        
-        # Hash both sides
-        left_hash = hash_multi_columns(left_keys)
-        right_hash = hash_multi_columns(right_keys)
-        
-        # Determine target device for each row based on hash
-        left_device = left_hash % self.n_devices
-        right_device = right_hash % self.n_devices
-        
-        def redistribute_by_hash(data, device_assignment):
-            """Redistribute data to target devices based on hash."""
-            # This would use all_to_all in a real implementation
-            # For now, we'll use a simplified approach
-            
-            # Count how many elements go to each device
-            send_counts = jnp.array([
-                jnp.sum(device_assignment == d) for d in range(self.n_devices)
-            ])
-            
-            # In production, use all_to_all collective here
-            # redistributed = all_to_all(data, send_counts, ...)
-            
-            return data  # Simplified for now
-        
-        # Redistribute both sides
-        left_redistributed = {
-            'keys': left_keys,
-            'values': left_values,
-            'device': left_device
-        }
-        right_redistributed = {
-            'keys': right_keys,
-            'values': right_values,
-            'device': right_device
-        }
-        
-        def local_join_shard(left_shard, right_shard):
-            """Perform join within each shard."""
-            # Filter to only rows assigned to this device
-            # Then perform local join using broadcasting
-            
-            # This is simplified - full implementation would handle
-            # the actual data movement and local joining
-            return left_shard, right_shard
-        
-        # Apply distributed join
-        with self.mesh:
-            result = shard_map(
-                local_join_shard,
-                mesh=self.mesh,
-                in_specs=(P('devices'), P('devices')),
-                out_specs=(P('devices'), P('devices'))
-            )(left_redistributed, right_redistributed)
-        
-        return result
-    
+
+        left_keys, left_values = compact_repartitioned_rows(
+            *collective_hash_repartition(
+                left_keys,
+                left_values,
+                key_dtypes={str(i): str(key.dtype) for i, key in enumerate(left_keys)},
+                value_dtypes={name: str(arr.dtype) for name, arr in left_values.items()},
+                sharding_spec=self.sharding_spec,
+            )
+        )
+        right_keys, right_values = compact_repartitioned_rows(
+            *collective_hash_repartition(
+                right_keys,
+                right_values,
+                key_dtypes={str(i): str(key.dtype) for i, key in enumerate(right_keys)},
+                value_dtypes={name: str(arr.dtype) for name, arr in right_values.items()},
+                sharding_spec=self.sharding_spec,
+            )
+        )
+
+        joiner = ParallelSortMergeJoin(self.sharding_spec)
+        return joiner.join_multi_column(
+            left_keys, list(range(len(left_keys))), left_values,
+            right_keys, list(range(len(right_keys))), right_values,
+            how,
+        )
+
     def distributed_groupby_aggregate(
         self,
-        keys: List[Array],
-        values: Dict[str, Array],
-        agg_funcs: Dict[str, str]
-    ) -> Tuple[Dict[str, Array], Dict[str, Array]]:
+        keys: list[Array],
+        values: dict[str, Array],
+        agg_funcs: dict[str, str]
+    ) -> tuple[dict[str, Array], dict[str, Array]]:
         """
         Distributed groupby using hash-based redistribution.
         
@@ -150,43 +123,27 @@ class DistributedMultiColumnOps:
         """
         if self.n_devices == 1:
             # Fall back to single-device implementation
-            from .parallel_algorithms import SortBasedGroupBy
             groupby = SortBasedGroupBy(self.sharding_spec)
             return groupby.groupby_aggregate_multi_column(
                 keys, list(range(len(keys))), values, agg_funcs
             )
-        
-        # Hash keys for distribution
-        hash_keys = hash_multi_columns(keys)
-        device_assignment = hash_keys % self.n_devices
-        
-        def local_groupby_shard(local_keys, local_values, local_agg_funcs):
-            """Perform groupby within each shard."""
-            # Local groupby implementation
-            from .parallel_algorithms import SortBasedGroupBy
-            local_groupby = SortBasedGroupBy(self.sharding_spec)
-            return local_groupby.groupby_aggregate_multi_column(
-                local_keys, list(range(len(local_keys))), 
-                local_values, local_agg_funcs
+
+        keys, values = compact_repartitioned_rows(
+            *collective_hash_repartition(
+                keys,
+                values,
+                key_dtypes={str(i): str(key.dtype) for i, key in enumerate(keys)},
+                value_dtypes={name: str(arr.dtype) for name, arr in values.items()},
+                sharding_spec=self.sharding_spec,
             )
-        
-        # Apply distributed groupby
-        with self.mesh:
-            # First redistribute by hash
-            # Then perform local groupby
-            # Finally combine results if needed
-            
-            result = shard_map(
-                local_groupby_shard,
-                mesh=self.mesh,
-                in_specs=(P('devices'), P('devices'), None),
-                out_specs=(P('devices'), P('devices'))
-            )(keys, values, agg_funcs)
-        
-        return result
+        )
+        groupby = SortBasedGroupBy(self.sharding_spec)
+        return groupby.groupby_aggregate_multi_column(
+            keys, list(range(len(keys))), values, agg_funcs
+        )
 
 
-def create_distributed_ops(mesh: Optional[Mesh] = None) -> DistributedMultiColumnOps:
+def create_distributed_ops(mesh: Mesh | None = None) -> DistributedMultiColumnOps:
     """
     Create a distributed operations handler.
     
@@ -203,6 +160,6 @@ def create_distributed_ops(mesh: Optional[Mesh] = None) -> DistributedMultiColum
     if mesh is None:
         devices = jax.devices()
         mesh = Mesh(devices, axis_names=('devices',))
-    
+
     sharding_spec = ShardingSpec(mesh=mesh, row_sharding=True)
     return DistributedMultiColumnOps(sharding_spec)

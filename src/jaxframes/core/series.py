@@ -1,18 +1,30 @@
 """JaxSeries: Series class for JaxFrames."""
 
-from typing import Optional, Any, Union, TYPE_CHECKING
-import numpy as np
-import pandas as pd
+from typing import TYPE_CHECKING, Any, Optional
+
 import jax
 import jax.numpy as jnp
+import numpy as np
+import pandas as pd
 from jax import Array
 from jax.tree_util import register_pytree_node
-from .jit_utils import (
-    auto_jit, get_binary_op, get_unary_op, get_reduction_op,
-    is_jax_compatible, OperationChain
-)
-from ..lazy.expressions import Column, Literal, Expr
+
+from ..lazy.expressions import Column, Expr, Literal
 from ..ops.comparison import ComparisonOp, ComparisonOpType
+from .jit_utils import (
+    OperationChain,
+    get_binary_op,
+    get_reduction_op,
+    get_unary_op,
+)
+from .string_encoding import (
+    align_string_code_arrays,
+    decode_string_codes,
+    encode_string_array,
+    is_string_array,
+    string_scalar_code,
+    string_scalar_rank,
+)
 
 if TYPE_CHECKING:
     from .frame import JaxFrame
@@ -36,11 +48,11 @@ class JaxSeries:
     dtype : optional
         Data type for the series
     """
-    
-    def __init__(self, data: Union[Array, np.ndarray, list, None] = None, name: Optional[str] = None,
-                 index: Optional[Any] = None, dtype: Optional[Any] = None,
+
+    def __init__(self, data: Array | np.ndarray | list | None = None, name: str | None = None,
+                 index: Any | None = None, dtype: Any | None = None,
                  lazy: bool = False, parent_frame: Optional['JaxFrame'] = None,
-                 expr: Optional[Expr] = None):
+                 expr: Expr | None = None):
         """Initialize a JaxSeries.
 
         Parameters
@@ -65,6 +77,7 @@ class JaxSeries:
         self._expr = expr
         self.name = name
         self.index = index
+        self._string_vocab: tuple[str, ...] | None = None
 
         # Lazy mode: minimal initialization
         if lazy:
@@ -81,38 +94,64 @@ class JaxSeries:
         if isinstance(data, list):
             data = np.array(data, dtype=dtype if dtype else None)
 
-        if isinstance(data, np.ndarray):
-            if data.dtype == np.object_ or not self._is_jax_compatible(data):
-                # Keep as numpy object array for non-JAX types
-                self.data = data
-                self._dtype = 'object'
-            else:
-                # Convert to JAX array for compatible types
-                self.data = jnp.array(data, dtype=dtype) if dtype else jnp.array(data)
-                self._dtype = str(self.data.dtype)
-        else:
-            # Already a JAX array
-            self.data = data
-            self._dtype = str(data.dtype)
+        self.data, self._dtype = self._process_data(data, dtype=dtype)
 
         self._length = len(self.data)
-    
+
     @property
     def shape(self):
         """Return shape of the Series."""
         return (self._length,)
-    
+
     def _is_jax_compatible(self, arr: np.ndarray) -> bool:
         """Check if array can be converted to JAX array."""
-        try:
-            if arr.dtype == np.object_:
-                return False
-            # Try to convert to JAX array
-            _ = jnp.array(arr)
-            return True
-        except (TypeError, ValueError):
-            return False
-    
+        return arr.dtype != np.object_ and arr.dtype.kind in {'b', 'i', 'u', 'f', 'c'}
+
+    @classmethod
+    def _from_processed_data(
+        cls,
+        data: Array | np.ndarray,
+        name: str | None = None,
+        index: Any | None = None,
+        dtype: Any | None = None,
+        string_vocab: tuple[str, ...] | None = None,
+    ) -> 'JaxSeries':
+        """Create a series from already-processed data without re-coercion."""
+        series = cls.__new__(cls)
+        series._lazy = False
+        series._parent_frame = None
+        series._expr = None
+        series.name = name
+        series.index = index
+        series.data = data
+        series._string_vocab = string_vocab
+        series._dtype = str(dtype) if dtype not in (None, 'object') else ('object' if getattr(data, 'dtype', None) == np.object_ else str(getattr(data, 'dtype', dtype)))
+        if getattr(data, 'dtype', None) == np.object_:
+            series._dtype = 'object'
+        series._length = len(data)
+        return series
+
+    def _process_data(
+        self,
+        data: Array | np.ndarray,
+        dtype: Any | None = None
+    ) -> tuple[Array | np.ndarray, str]:
+        """Normalize external data into either a JAX array or object ndarray."""
+        if isinstance(data, jax.Array):
+            return data if dtype is None else data.astype(dtype), str(data.dtype if dtype is None else dtype)
+
+        if isinstance(data, np.ndarray):
+            if is_string_array(data):
+                arr, vocab = encode_string_array(data)
+                self._string_vocab = vocab
+                return arr, 'string'
+            if data.dtype == np.object_ or not self._is_jax_compatible(data):
+                return data, 'object'
+            arr = jnp.asarray(data, dtype=dtype) if dtype else jnp.asarray(data)
+            return arr, str(arr.dtype)
+
+        return data, str(data.dtype)
+
     def to_pandas(self) -> pd.Series:
         """
         Convert JaxSeries to pandas Series.
@@ -122,27 +161,31 @@ class JaxSeries:
         pd.Series
             Equivalent pandas Series
         """
-        if isinstance(self.data, (jax.Array, jnp.ndarray)):
+        if self._dtype == 'string':
+            numpy_data = decode_string_codes(self.data, self._string_vocab or ())
+        elif isinstance(self.data, (jax.Array, jnp.ndarray)):
             # Convert JAX array to numpy for pandas
             numpy_data = np.array(self.data)
         else:
             # Already a numpy array (object type)
             numpy_data = self.data
-        
+
         return pd.Series(numpy_data, name=self.name, index=self.index)
-    
+
     def __add__(self, other):
         """Element-wise addition with automatic JIT compilation."""
         if self._dtype == 'object':
             # For object arrays, try element-wise operation
             if isinstance(other, JaxSeries):
                 if other._dtype == 'object':
-                    result = np.array([a + b for a, b in zip(self.data, other.data)], dtype=object)
+                    result = np.array([a + b for a, b in zip(self.data, other.data, strict=False)], dtype=object)
                 else:
-                    result = np.array([a + b for a, b in zip(self.data, other.data)], dtype=object)
+                    result = np.array([a + b for a, b in zip(self.data, other.data, strict=False)], dtype=object)
             else:
                 result = np.array([a + other for a in self.data], dtype=object)
             return JaxSeries(result, name=self.name)
+        elif self._dtype == 'string':
+            raise TypeError("String addition is not accelerated; convert to pandas/object data first")
         else:
             # Use JIT-compiled operation for JAX arrays
             add_op = get_binary_op('add')
@@ -150,20 +193,22 @@ class JaxSeries:
                 result = add_op(self.data, other.data)
             else:
                 result = add_op(self.data, other)
-            return JaxSeries(result, name=self.name)
-    
+            return JaxSeries._from_processed_data(result, name=self.name)
+
     def __mul__(self, other):
         """Element-wise multiplication with automatic JIT compilation."""
         if self._dtype == 'object':
             # For object arrays, try element-wise operation
             if isinstance(other, JaxSeries):
                 if other._dtype == 'object':
-                    result = np.array([a * b for a, b in zip(self.data, other.data)], dtype=object)
+                    result = np.array([a * b for a, b in zip(self.data, other.data, strict=False)], dtype=object)
                 else:
-                    result = np.array([a * b for a, b in zip(self.data, other.data)], dtype=object)
+                    result = np.array([a * b for a, b in zip(self.data, other.data, strict=False)], dtype=object)
             else:
                 result = np.array([a * other for a in self.data], dtype=object)
             return JaxSeries(result, name=self.name)
+        elif self._dtype == 'string':
+            raise TypeError("String multiplication is not accelerated; convert to pandas/object data first")
         else:
             # Use JIT-compiled operation for JAX arrays
             mul_op = get_binary_op('multiply')
@@ -171,17 +216,19 @@ class JaxSeries:
                 result = mul_op(self.data, other.data)
             else:
                 result = mul_op(self.data, other)
-            return JaxSeries(result, name=self.name)
-    
+            return JaxSeries._from_processed_data(result, name=self.name)
+
     def __sub__(self, other):
         """Element-wise subtraction with automatic JIT compilation."""
         if self._dtype == 'object':
             # For object arrays, fallback to Python operations
             if isinstance(other, JaxSeries):
-                result = np.array([a - b for a, b in zip(self.data, other.data)], dtype=object)
+                result = np.array([a - b for a, b in zip(self.data, other.data, strict=False)], dtype=object)
             else:
                 result = np.array([a - other for a in self.data], dtype=object)
             return JaxSeries(result, name=self.name)
+        elif self._dtype == 'string':
+            raise TypeError("String subtraction is not supported")
         else:
             # Use JIT-compiled operation
             sub_op = get_binary_op('subtract')
@@ -189,17 +236,19 @@ class JaxSeries:
                 result = sub_op(self.data, other.data)
             else:
                 result = sub_op(self.data, other)
-            return JaxSeries(result, name=self.name)
-    
+            return JaxSeries._from_processed_data(result, name=self.name)
+
     def __truediv__(self, other):
         """Element-wise division with automatic JIT compilation."""
         if self._dtype == 'object':
             # For object arrays, fallback to Python operations
             if isinstance(other, JaxSeries):
-                result = np.array([a / b for a, b in zip(self.data, other.data)], dtype=object)
+                result = np.array([a / b for a, b in zip(self.data, other.data, strict=False)], dtype=object)
             else:
                 result = np.array([a / other for a in self.data], dtype=object)
             return JaxSeries(result, name=self.name)
+        elif self._dtype == 'string':
+            raise TypeError("String division is not supported")
         else:
             # Use JIT-compiled operation
             div_op = get_binary_op('divide')
@@ -207,17 +256,19 @@ class JaxSeries:
                 result = div_op(self.data, other.data)
             else:
                 result = div_op(self.data, other)
-            return JaxSeries(result, name=self.name)
-    
+            return JaxSeries._from_processed_data(result, name=self.name)
+
     def __pow__(self, other):
         """Element-wise power with automatic JIT compilation."""
         if self._dtype == 'object':
             # For object arrays, fallback to Python operations
             if isinstance(other, JaxSeries):
-                result = np.array([a ** b for a, b in zip(self.data, other.data)], dtype=object)
+                result = np.array([a ** b for a, b in zip(self.data, other.data, strict=False)], dtype=object)
             else:
                 result = np.array([a ** other for a in self.data], dtype=object)
             return JaxSeries(result, name=self.name)
+        elif self._dtype == 'string':
+            raise TypeError("String exponentiation is not supported")
         else:
             # Use JIT-compiled operation
             pow_op = get_binary_op('power')
@@ -225,16 +276,16 @@ class JaxSeries:
                 result = pow_op(self.data, other.data)
             else:
                 result = pow_op(self.data, other)
-            return JaxSeries(result, name=self.name)
-    
+            return JaxSeries._from_processed_data(result, name=self.name)
+
     def abs(self):
         """Absolute value with automatic JIT compilation."""
         if self._dtype == 'object':
             return JaxSeries(np.array([abs(x) for x in self.data], dtype=object), name=self.name)
         else:
             abs_op = get_unary_op('abs')
-            return JaxSeries(abs_op(self.data), name=self.name)
-    
+            return JaxSeries._from_processed_data(abs_op(self.data), name=self.name)
+
     def sqrt(self):
         """Square root with automatic JIT compilation."""
         if self._dtype == 'object':
@@ -242,8 +293,8 @@ class JaxSeries:
             return JaxSeries(np.array([math.sqrt(x) if x >= 0 else float('nan') for x in self.data], dtype=object), name=self.name)
         else:
             sqrt_op = get_unary_op('sqrt')
-            return JaxSeries(sqrt_op(self.data), name=self.name)
-    
+            return JaxSeries._from_processed_data(sqrt_op(self.data), name=self.name)
+
     def exp(self):
         """Exponential with automatic JIT compilation."""
         if self._dtype == 'object':
@@ -251,8 +302,8 @@ class JaxSeries:
             return JaxSeries(np.array([math.exp(x) for x in self.data], dtype=object), name=self.name)
         else:
             exp_op = get_unary_op('exp')
-            return JaxSeries(exp_op(self.data), name=self.name)
-    
+            return JaxSeries._from_processed_data(exp_op(self.data), name=self.name)
+
     def log(self):
         """Natural logarithm with automatic JIT compilation."""
         if self._dtype == 'object':
@@ -260,13 +311,15 @@ class JaxSeries:
             return JaxSeries(np.array([math.log(x) if x > 0 else float('nan') for x in self.data], dtype=object), name=self.name)
         else:
             log_op = get_unary_op('log')
-            return JaxSeries(log_op(self.data), name=self.name)
-    
+            return JaxSeries._from_processed_data(log_op(self.data), name=self.name)
+
     def sum(self):
         """Compute sum of the series with automatic JIT compilation."""
-        if self._dtype == 'object':
+        if self._dtype in {'object', 'string'}:
             # Try to sum object array elements
             try:
+                if self._dtype == 'string':
+                    return ''.join(value for value in self.to_pandas().tolist() if value is not None)
                 # Use Python's sum with appropriate start value
                 if len(self.data) == 0:
                     return None
@@ -287,61 +340,61 @@ class JaxSeries:
             # Use JIT-compiled reduction
             sum_op = get_reduction_op('sum')
             return sum_op(self.data)
-    
+
     def mean(self):
         """Compute mean of the series with automatic JIT compilation."""
-        if self._dtype == 'object':
+        if self._dtype in {'object', 'string'}:
             # Cannot compute mean for object arrays
             return None
         else:
             # Use JIT-compiled reduction
             mean_op = get_reduction_op('mean')
             return mean_op(self.data)
-    
+
     def max(self):
         """Compute maximum of the series with automatic JIT compilation."""
-        if self._dtype == 'object':
+        if self._dtype in {'object', 'string'}:
             # Try to find max of object array elements
             try:
-                return max(self.data)
+                return max(value for value in self.to_pandas().tolist() if value is not None)
             except (TypeError, ValueError):
                 return None
         else:
             # Use JIT-compiled reduction
             max_op = get_reduction_op('max')
             return max_op(self.data)
-    
+
     def min(self):
         """Compute minimum of the series with automatic JIT compilation."""
-        if self._dtype == 'object':
+        if self._dtype in {'object', 'string'}:
             # Try to find min of object array elements
             try:
-                return min(self.data)
+                return min(value for value in self.to_pandas().tolist() if value is not None)
             except (TypeError, ValueError):
                 return None
         else:
             # Use JIT-compiled reduction
             min_op = get_reduction_op('min')
             return min_op(self.data)
-    
+
     def std(self):
         """Compute standard deviation with automatic JIT compilation."""
-        if self._dtype == 'object':
+        if self._dtype in {'object', 'string'}:
             return None
         else:
             # Use JIT-compiled reduction
             std_op = get_reduction_op('std')
             return std_op(self.data)
-    
+
     def var(self):
         """Compute variance with automatic JIT compilation."""
-        if self._dtype == 'object':
+        if self._dtype in {'object', 'string'}:
             return None
         else:
             # Use JIT-compiled reduction
             var_op = get_reduction_op('var')
             return var_op(self.data)
-    
+
     def chain_operations(self) -> OperationChain:
         """Create an operation chain for complex expressions."""
         return OperationChain(self.data)
@@ -379,13 +432,39 @@ class JaxSeries:
 
         # Eager mode: execute immediately
         if isinstance(other, JaxSeries):
-            result = self._apply_comparison(self.data, other.data, op_type)
+            if self._dtype == 'string' and other._dtype == 'string':
+                left, right, _ = align_string_code_arrays(
+                    self.data,
+                    self._string_vocab or (),
+                    other.data,
+                    other._string_vocab or (),
+                )
+                result = self._apply_comparison(left, right, op_type)
+            else:
+                result = self._apply_comparison(self.data, other.data, op_type)
+        elif self._dtype == 'string' and (other is None or isinstance(other, str)):
+            exact_code = string_scalar_code(self._string_vocab or (), other)
+            if op_type == ComparisonOpType.EQ:
+                if exact_code is None:
+                    result = jnp.zeros_like(self.data, dtype=bool)
+                else:
+                    result = self.data == exact_code
+            elif op_type == ComparisonOpType.NE:
+                if exact_code is None:
+                    result = jnp.ones_like(self.data, dtype=bool)
+                else:
+                    result = self.data != exact_code
+            else:
+                if other is None:
+                    return NotImplemented
+                rank = string_scalar_rank(self._string_vocab or (), other)
+                result = self._apply_comparison(self.data, rank, op_type)
         elif isinstance(other, (int, float, np.number)):
             result = self._apply_comparison(self.data, other, op_type)
         else:
             return NotImplemented
 
-        return JaxSeries(result, name=self.name)
+        return JaxSeries._from_processed_data(result, name=self.name)
 
     def _apply_comparison(self, left, right, op_type: ComparisonOpType):
         """Apply comparison operation in eager mode."""
@@ -498,10 +577,16 @@ class JaxSeries:
 
     def __array__(self):
         """Convert to numpy array for compatibility with numpy functions."""
+        if self._dtype == 'string':
+            return decode_string_codes(self.data, self._string_vocab or ())
         if isinstance(self.data, (jax.Array, jnp.ndarray)):
             return np.array(self.data)
         else:
             return self.data
+
+    def tolist(self):
+        """Convert series values to a Python list."""
+        return self.to_pandas().tolist()
 
     def __repr__(self) -> str:
         """Return string representation."""
@@ -516,12 +601,18 @@ def _jaxseries_flatten(js: JaxSeries):
     if isinstance(js.data, (jax.Array, jnp.ndarray)) and js.data.dtype != np.object_:
         # JAX array as child
         children = [js.data]
-        aux_data = {'name': js.name, 'index': js.index, 'dtype': js._dtype, 'is_jax': True}
+        aux_data = {
+            'name': js.name,
+            'index': js.index,
+            'dtype': js._dtype,
+            'is_jax': True,
+            'string_vocab': js._string_vocab,
+        }
     else:
         # Object array - no children
         children = []
-        aux_data = {'name': js.name, 'index': js.index, 'dtype': js._dtype, 
-                   'data': js.data, 'is_jax': False}
+        aux_data = {'name': js.name, 'index': js.index, 'dtype': js._dtype,
+                   'data': js.data, 'is_jax': False, 'string_vocab': js._string_vocab}
     return children, aux_data
 
 
@@ -533,9 +624,10 @@ def _jaxseries_unflatten(aux_data, children):
     else:
         # Reconstruct from object array
         data = aux_data['data']
-    
+
     js = JaxSeries(data, name=aux_data['name'], index=aux_data['index'])
     js._dtype = aux_data['dtype']
+    js._string_vocab = aux_data.get('string_vocab')
     return js
 
 

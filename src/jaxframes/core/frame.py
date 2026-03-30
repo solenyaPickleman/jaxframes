@@ -1,22 +1,47 @@
 """JaxFrame: Main DataFrame class for JaxFrames."""
 
-from typing import Dict, Optional, Any, Union, List
-import numpy as np
-import pandas as pd
+from typing import Any, Union
+
 import jax
 import jax.numpy as jnp
+import numpy as np
+import pandas as pd
 from jax import Array
 from jax.tree_util import register_pytree_node
-from .jit_utils import (
-    auto_jit, get_binary_op, get_reduction_op,
-    is_jax_compatible, jit_registry, OperationChain
-)
-from ..lazy.plan import (
-    LogicalPlan, InputPlan, SelectPlan, ProjectPlan,
-    BinaryOpPlan, AggregatePlan, FilterPlan,
-    SortPlan, GroupByPlan, JoinPlan, LimitPlan
-)
+
 from ..lazy.expressions import Column
+from ..lazy.plan import (
+    AggregatePlan,
+    BinaryOpPlan,
+    FilterPlan,
+    GroupByPlan,
+    InputPlan,
+    JoinPlan,
+    LimitPlan,
+    LogicalPlan,
+    ProjectPlan,
+    SelectPlan,
+    SortPlan,
+)
+from .jit_utils import (
+    auto_jit,
+    get_binary_op,
+    get_reduction_op,
+)
+from .string_encoding import (
+    align_string_code_arrays,
+    decode_string_codes,
+    encode_string_array,
+    is_string_array,
+    sortable_string_codes,
+)
+from .string_fastpaths import (
+    assemble_string_join_payloads,
+    can_use_string_groupby_fastpath,
+    can_use_string_join_fastpath,
+    groupby_encoded_strings,
+    join_encoded_strings,
+)
 
 
 class JaxFrame:
@@ -42,10 +67,10 @@ class JaxFrame:
 
     def __init__(
         self,
-        data: Optional[Dict[str, Union[Array, np.ndarray]]] = None,
-        index: Optional[Any] = None,
+        data: dict[str, Array | np.ndarray] | None = None,
+        index: Any | None = None,
         lazy: bool = False,
-        plan: Optional[LogicalPlan] = None
+        plan: LogicalPlan | None = None
     ):
         """Initialize a JaxFrame."""
         self._lazy = lazy
@@ -54,87 +79,124 @@ class JaxFrame:
 
         # If lazy mode and plan is provided, use it
         if lazy and plan is not None:
-            self._columns = plan.schema()
+            self._columns = list(plan.schema().keys())
             self._length = None  # Unknown until collected
             self.data = {}  # Empty, will be filled on collect()
             self._dtypes = {}
+            self._numeric_columns = []
+            self._string_vocabs = {}
             return
 
         # If lazy mode with data, create an InputPlan
         if lazy and data is not None:
-            self.data = {}
-            self._dtypes = {}
-            self._columns = list(data.keys())
-
-            # Process data first
-            processed_data = {}
-            for col_name, arr in data.items():
-                if isinstance(arr, (np.ndarray, list)):
-                    if isinstance(arr, list):
-                        arr = np.array(arr)
-
-                    if arr.dtype == np.object_ or not self._is_jax_compatible(arr):
-                        processed_data[col_name] = arr if isinstance(arr, np.ndarray) else np.array(arr, dtype=object)
-                        self._dtypes[col_name] = 'object'
-                    else:
-                        processed_data[col_name] = jnp.array(arr)
-                        self._dtypes[col_name] = str(arr.dtype)
-                else:
-                    processed_data[col_name] = arr
-                    self._dtypes[col_name] = str(arr.dtype)
+            processed_data, dtypes, string_vocabs = self._coerce_data_mapping(data)
 
             # Create InputPlan
-            self._plan = InputPlan(data=processed_data, column_names=self._columns)
-            self.data = processed_data  # Store for later use
-
-            # Set length
-            if self.data:
-                lengths = [len(arr) for arr in self.data.values()]
-                if not all(length == lengths[0] for length in lengths):
-                    raise ValueError("All arrays must have the same length")
-                self._length = lengths[0]
-            else:
-                self._length = 0
+            self._plan = InputPlan(data=processed_data, column_names=list(processed_data.keys()))
+            self._initialize_eager_state(processed_data, dtypes, string_vocabs=string_vocabs, validate_lengths=True)
             return
 
         # Eager mode (default)
         if data is None:
             data = {}
 
-        # Process data to handle both JAX arrays and object arrays
-        self.data = {}
-        self._dtypes = {}
+        processed_data, dtypes, string_vocabs = self._coerce_data_mapping(data)
+        self._initialize_eager_state(processed_data, dtypes, string_vocabs=string_vocabs, validate_lengths=True)
 
-        for col_name, arr in data.items():
-            if isinstance(arr, (np.ndarray, list)):
-                # Check if it's an object array or can be converted to JAX
-                if isinstance(arr, list):
-                    arr = np.array(arr)
+    @classmethod
+    def _from_processed_data(
+        cls,
+        data: dict[str, Array | np.ndarray],
+        index: Any | None = None,
+        dtypes: dict[str, str] | None = None,
+        string_vocabs: dict[str, tuple[str, ...]] | None = None,
+        validate_lengths: bool = False,
+    ) -> 'JaxFrame':
+        """Create a frame from internal already-processed column data."""
+        frame = cls.__new__(cls)
+        frame._lazy = False
+        frame._plan = None
+        frame.index = index
+        inferred_dtypes = dtypes or {col: cls._infer_dtype_name(arr) for col, arr in data.items()}
+        frame._initialize_eager_state(
+            data,
+            inferred_dtypes,
+            string_vocabs=string_vocabs or {},
+            validate_lengths=validate_lengths,
+        )
+        return frame
 
-                if arr.dtype == np.object_ or not self._is_jax_compatible(arr):
-                    # Keep as numpy object array for non-JAX types
-                    self.data[col_name] = arr if isinstance(arr, np.ndarray) else np.array(arr, dtype=object)
-                    self._dtypes[col_name] = 'object'
-                else:
-                    # Convert to JAX array for compatible types
-                    self.data[col_name] = jnp.array(arr)
-                    self._dtypes[col_name] = str(arr.dtype)
-            else:
-                # Already a JAX array
-                self.data[col_name] = arr
-                self._dtypes[col_name] = str(arr.dtype)
+    @staticmethod
+    def _infer_dtype_name(arr: Array | np.ndarray) -> str:
+        """Return the logical dtype label used by the frame internals."""
+        if isinstance(arr, np.ndarray) and arr.dtype == np.object_:
+            return 'object'
+        return str(arr.dtype)
 
+    @staticmethod
+    def _compute_frame_length(
+        data: dict[str, Array | np.ndarray],
+        validate_lengths: bool = True
+    ) -> int:
+        """Compute frame length and optionally validate equal-length columns."""
+        if not data:
+            return 0
+
+        lengths = [len(arr) for arr in data.values()]
+        if validate_lengths and not all(length == lengths[0] for length in lengths):
+            raise ValueError("All arrays must have the same length")
+        return lengths[0]
+
+    def _initialize_eager_state(
+        self,
+        data: dict[str, Array | np.ndarray],
+        dtypes: dict[str, str],
+        string_vocabs: dict[str, tuple[str, ...]] | None = None,
+        validate_lengths: bool = True
+    ) -> None:
+        """Populate eager frame metadata from processed arrays."""
+        self.data = data
+        self._dtypes = dtypes
+        self._string_vocabs = string_vocabs or {}
         self._columns = list(data.keys())
+        self._numeric_columns = [col for col in self._columns if dtypes[col] not in {'object', 'string'}]
+        self._length = self._compute_frame_length(data, validate_lengths=validate_lengths)
 
-        # Validate that all arrays have the same length
-        if self.data:
-            lengths = [len(arr) for arr in self.data.values()]
-            if not all(length == lengths[0] for length in lengths):
-                raise ValueError("All arrays must have the same length")
-            self._length = lengths[0]
-        else:
-            self._length = 0
-    
+    def _coerce_column(self, arr: Array | np.ndarray | list) -> tuple[Array | np.ndarray, str, tuple[str, ...] | None]:
+        """Convert external column data into a JAX array or object ndarray."""
+        if isinstance(arr, list):
+            arr = np.array(arr)
+
+        if isinstance(arr, jax.Array):
+            return arr, str(arr.dtype), None
+
+        if isinstance(arr, np.ndarray):
+            if is_string_array(arr):
+                codes, vocab = encode_string_array(arr)
+                return codes, 'string', vocab
+            if arr.dtype == np.object_ or not self._is_jax_compatible(arr):
+                return arr, 'object', None
+            coerced = jnp.asarray(arr)
+            return coerced, str(coerced.dtype), None
+
+        return arr, str(arr.dtype), None
+
+    def _coerce_data_mapping(
+        self,
+        data: dict[str, Array | np.ndarray]
+    ) -> tuple[dict[str, Array | np.ndarray], dict[str, str], dict[str, tuple[str, ...]]]:
+        """Coerce all columns in a mapping into the internal representation."""
+        processed_data: dict[str, Array | np.ndarray] = {}
+        dtypes: dict[str, str] = {}
+        string_vocabs: dict[str, tuple[str, ...]] = {}
+        for col_name, arr in data.items():
+            processed_col, dtype_name, string_vocab = self._coerce_column(arr)
+            processed_data[col_name] = processed_col
+            dtypes[col_name] = dtype_name
+            if string_vocab is not None:
+                string_vocabs[col_name] = string_vocab
+        return processed_data, dtypes, string_vocabs
+
     @property
     def columns(self):
         """Return column names."""
@@ -154,18 +216,72 @@ class JaxFrame:
     def plan(self):
         """Return the logical plan (None if eager)."""
         return self._plan
-    
+
     def _is_jax_compatible(self, arr: np.ndarray) -> bool:
         """Check if array can be converted to JAX array."""
-        try:
-            if arr.dtype == np.object_:
-                return False
-            # Try to convert to JAX array
-            _ = jnp.array(arr)
-            return True
-        except (TypeError, ValueError):
-            return False
-    
+        return arr.dtype != np.object_ and arr.dtype.kind in {'b', 'i', 'u', 'f', 'c'}
+
+    def _reduce_numeric_columns(self, op_name: str) -> tuple[list[str], Array]:
+        """Reduce numeric columns in dtype-homogeneous batches."""
+        ordered_scalars: list[Array] = []
+        ordered_columns: list[str] = []
+
+        if not self._numeric_columns:
+            return ordered_columns, jnp.array([])
+
+        dtype_groups: dict[str, list[str]] = {}
+        for col in self._numeric_columns:
+            dtype_groups.setdefault(self._dtypes[col], []).append(col)
+
+        for cols in dtype_groups.values():
+            arrays = [self.data[col] for col in cols]
+            if len(arrays) == 1:
+                reduced = get_reduction_op(op_name)(arrays[0]).reshape(1)
+            else:
+                stacked = jnp.stack(arrays, axis=0)
+                reduced = get_reduction_op(op_name, axis=1)(stacked)
+            ordered_columns.extend(cols)
+            ordered_scalars.extend(list(reduced))
+
+        if not ordered_scalars:
+            return [], jnp.array([])
+
+        return ordered_columns, jnp.stack(ordered_scalars)
+
+    def _resolve_execution_sharding(self, other: Any | None = None):
+        """Use existing distributed sharding when available, else all local devices."""
+        sharding = getattr(self, 'sharding', None)
+        if sharding is not None:
+            return sharding
+
+        if other is not None:
+            other_sharding = getattr(other, 'sharding', None)
+            if other_sharding is not None:
+                return other_sharding
+
+        from ..distributed.sharding import ShardingSpec, create_device_mesh
+
+        mesh = create_device_mesh(devices=jax.devices())
+        return ShardingSpec(mesh=mesh, row_sharding=False)
+
+    def _wrap_eager_result(
+        self,
+        result_data: dict[str, Array | np.ndarray],
+        index: Any = ...,
+        dtypes: dict[str, str] | None = None,
+        string_vocabs: dict[str, tuple[str, ...]] | None = None,
+    ) -> 'JaxFrame':
+        """Wrap already-processed result arrays without reprocessing them."""
+        return self._from_processed_data(
+            result_data,
+            index=self.index if index is ... else index,
+            dtypes=dtypes,
+            string_vocabs=string_vocabs if string_vocabs is not None else {
+                col: self._string_vocabs[col] for col in result_data if col in self._string_vocabs
+            },
+            validate_lengths=False,
+        )
+
     def to_pandas(self) -> pd.DataFrame:
         """
         Convert JaxFrame to pandas DataFrame.
@@ -177,13 +293,15 @@ class JaxFrame:
         """
         pandas_data = {}
         for col_name, arr in self.data.items():
-            if isinstance(arr, (jax.Array, jnp.ndarray)):
+            if self._dtypes.get(col_name) == 'string':
+                arr_np = decode_string_codes(arr, self._string_vocabs[col_name])
+            elif isinstance(arr, (jax.Array, jnp.ndarray)):
                 # Convert JAX array to numpy for pandas
                 arr_np = np.array(arr)
             else:
                 # Already a numpy array (object type)
                 arr_np = arr
-            
+
             # Ensure 1D array for pandas (flatten if needed)
             if arr_np.ndim > 1:
                 # For 2D object arrays, keep as 1D array of objects
@@ -193,10 +311,10 @@ class JaxFrame:
                     pandas_data[col_name] = arr_np.flatten()
             else:
                 pandas_data[col_name] = arr_np
-        
+
         return pd.DataFrame(pandas_data, index=self.index)
-    
-    def __getitem__(self, key: Union[str, List[str], 'JaxSeries']):
+
+    def __getitem__(self, key: Union[str, list[str], 'JaxSeries']):
         """Column selection or boolean indexing."""
         from .series import JaxSeries
 
@@ -217,7 +335,7 @@ class JaxFrame:
                 result_data = {}
                 for col_name, arr in self.data.items():
                     result_data[col_name] = arr[key.data]
-                return JaxFrame(result_data, index=None)
+                return self._wrap_eager_result(result_data, index=None, dtypes=self._dtypes.copy())
 
         elif isinstance(key, str):
             # Single column selection
@@ -234,7 +352,13 @@ class JaxFrame:
                 )
             else:
                 # Eager mode - return as JaxSeries
-                return JaxSeries(self.data[key], name=key)
+                return JaxSeries._from_processed_data(
+                    self.data[key],
+                    name=key,
+                    index=self.index,
+                    dtype=self._dtypes[key],
+                    string_vocab=self._string_vocabs.get(key),
+                )
 
         elif isinstance(key, list):
             # Multiple column selection
@@ -247,39 +371,36 @@ class JaxFrame:
             else:
                 # Eager mode - return as JaxFrame
                 selected_data = {col: self.data[col] for col in key}
-                return JaxFrame(selected_data, index=self.index)
+                selected_dtypes = {col: self._dtypes[col] for col in key}
+                return self._wrap_eager_result(selected_data, index=self.index, dtypes=selected_dtypes)
         else:
             raise TypeError(f"Column selection requires str, list, or JaxSeries, got {type(key)}")
-    
+
     def __setitem__(self, key: str, value: Union[Array, np.ndarray, 'JaxSeries']):
         """Column assignment."""
         from .series import JaxSeries
-        
+
         if isinstance(value, JaxSeries):
             value = value.data
-        
+
         # Validate length
         if len(value) != self._length:
             raise ValueError(f"Length of values ({len(value)}) does not match length of DataFrame ({self._length})")
-        
-        # Process the value similar to __init__
-        if isinstance(value, (np.ndarray, list)):
-            if isinstance(value, list):
-                value = np.array(value)
-            
-            if value.dtype == np.object_ or not self._is_jax_compatible(value):
-                self.data[key] = value if isinstance(value, np.ndarray) else np.array(value, dtype=object)
-                self._dtypes[key] = 'object'
-            else:
-                self.data[key] = jnp.array(value)
-                self._dtypes[key] = str(value.dtype)
+
+        processed_value, dtype_name, string_vocab = self._coerce_column(value)
+        if len(processed_value) != self._length:
+            raise ValueError(f"Length of values ({len(processed_value)}) does not match length of DataFrame ({self._length})")
+        self.data[key] = processed_value
+        self._dtypes[key] = dtype_name
+        if string_vocab is not None:
+            self._string_vocabs[key] = string_vocab
         else:
-            self.data[key] = value
-            self._dtypes[key] = str(value.dtype)
-        
+            self._string_vocabs.pop(key, None)
+
         if key not in self._columns:
             self._columns.append(key)
-    
+        self._numeric_columns = [col for col in self._columns if self._dtypes[col] not in {'object', 'string'}]
+
     def sum(self, axis: int = 0):
         """Compute sum of numeric columns with automatic JIT compilation."""
         # Lazy mode
@@ -292,21 +413,17 @@ class JaxFrame:
             return JaxFrame(data=None, index=self.index, lazy=True, plan=new_plan)
 
         # Eager mode
-        result = {}
-        sum_op = get_reduction_op('sum', axis=axis)
-
-        for col_name, arr in self.data.items():
-            if self._dtypes[col_name] != 'object':
-                # Use JIT-compiled sum for numeric columns
-                result[col_name] = sum_op(arr)
-
         if axis == 0:
             from .series import JaxSeries
-            return JaxSeries(jnp.array(list(result.values())),
-                           index=list(result.keys()))
+            columns, values = self._reduce_numeric_columns('sum')
+            return JaxSeries._from_processed_data(values, index=columns)
         else:
-            return JaxFrame(result)
-    
+            result = {}
+            sum_op = get_reduction_op('sum', axis=axis)
+            for col_name in self._numeric_columns:
+                result[col_name] = sum_op(self.data[col_name])
+            return self._wrap_eager_result(result)
+
     def mean(self, axis: int = 0):
         """Compute mean of numeric columns with automatic JIT compilation."""
         # Lazy mode
@@ -318,21 +435,17 @@ class JaxFrame:
             return JaxFrame(data=None, index=self.index, lazy=True, plan=new_plan)
 
         # Eager mode
-        result = {}
-        mean_op = get_reduction_op('mean', axis=axis)
-
-        for col_name, arr in self.data.items():
-            if self._dtypes[col_name] != 'object':
-                # Use JIT-compiled mean for numeric columns
-                result[col_name] = mean_op(arr)
-
         if axis == 0:
             from .series import JaxSeries
-            return JaxSeries(jnp.array(list(result.values())),
-                           index=list(result.keys()))
+            columns, values = self._reduce_numeric_columns('mean')
+            return JaxSeries._from_processed_data(values, index=columns)
         else:
-            return JaxFrame(result)
-    
+            result = {}
+            mean_op = get_reduction_op('mean', axis=axis)
+            for col_name in self._numeric_columns:
+                result[col_name] = mean_op(self.data[col_name])
+            return self._wrap_eager_result(result)
+
     def max(self, axis: int = 0):
         """Compute maximum of numeric columns with automatic JIT compilation."""
         # Lazy mode
@@ -343,21 +456,17 @@ class JaxFrame:
             return JaxFrame(data=None, index=self.index, lazy=True, plan=new_plan)
 
         # Eager mode
-        result = {}
-        max_op = get_reduction_op('max', axis=axis)
-
-        for col_name, arr in self.data.items():
-            if self._dtypes[col_name] != 'object':
-                # Use JIT-compiled max for numeric columns
-                result[col_name] = max_op(arr)
-
         if axis == 0:
             from .series import JaxSeries
-            return JaxSeries(jnp.array(list(result.values())),
-                           index=list(result.keys()))
+            columns, values = self._reduce_numeric_columns('max')
+            return JaxSeries._from_processed_data(values, index=columns)
         else:
-            return JaxFrame(result)
-    
+            result = {}
+            max_op = get_reduction_op('max', axis=axis)
+            for col_name in self._numeric_columns:
+                result[col_name] = max_op(self.data[col_name])
+            return self._wrap_eager_result(result)
+
     def min(self, axis: int = 0):
         """Compute minimum of numeric columns with automatic JIT compilation."""
         # Lazy mode
@@ -368,21 +477,17 @@ class JaxFrame:
             return JaxFrame(data=None, index=self.index, lazy=True, plan=new_plan)
 
         # Eager mode
-        result = {}
-        min_op = get_reduction_op('min', axis=axis)
-
-        for col_name, arr in self.data.items():
-            if self._dtypes[col_name] != 'object':
-                # Use JIT-compiled min for numeric columns
-                result[col_name] = min_op(arr)
-
         if axis == 0:
             from .series import JaxSeries
-            return JaxSeries(jnp.array(list(result.values())),
-                           index=list(result.keys()))
+            columns, values = self._reduce_numeric_columns('min')
+            return JaxSeries._from_processed_data(values, index=columns)
         else:
-            return JaxFrame(result)
-    
+            result = {}
+            min_op = get_reduction_op('min', axis=axis)
+            for col_name in self._numeric_columns:
+                result[col_name] = min_op(self.data[col_name])
+            return self._wrap_eager_result(result)
+
     def std(self, axis: int = 0):
         """Compute standard deviation of numeric columns with automatic JIT compilation."""
         # Lazy mode
@@ -393,21 +498,17 @@ class JaxFrame:
             return JaxFrame(data=None, index=self.index, lazy=True, plan=new_plan)
 
         # Eager mode
-        result = {}
-        std_op = get_reduction_op('std', axis=axis)
-
-        for col_name, arr in self.data.items():
-            if self._dtypes[col_name] != 'object':
-                # Use JIT-compiled std for numeric columns
-                result[col_name] = std_op(arr)
-
         if axis == 0:
             from .series import JaxSeries
-            return JaxSeries(jnp.array(list(result.values())),
-                           index=list(result.keys()))
+            columns, values = self._reduce_numeric_columns('std')
+            return JaxSeries._from_processed_data(values, index=columns)
         else:
-            return JaxFrame(result)
-    
+            result = {}
+            std_op = get_reduction_op('std', axis=axis)
+            for col_name in self._numeric_columns:
+                result[col_name] = std_op(self.data[col_name])
+            return self._wrap_eager_result(result)
+
     def var(self, axis: int = 0):
         """Compute variance of numeric columns with automatic JIT compilation."""
         # Lazy mode
@@ -418,49 +519,45 @@ class JaxFrame:
             return JaxFrame(data=None, index=self.index, lazy=True, plan=new_plan)
 
         # Eager mode
-        result = {}
-        var_op = get_reduction_op('var', axis=axis)
-
-        for col_name, arr in self.data.items():
-            if self._dtypes[col_name] != 'object':
-                # Use JIT-compiled var for numeric columns
-                result[col_name] = var_op(arr)
-
         if axis == 0:
             from .series import JaxSeries
-            return JaxSeries(jnp.array(list(result.values())),
-                           index=list(result.keys()))
+            columns, values = self._reduce_numeric_columns('var')
+            return JaxSeries._from_processed_data(values, index=columns)
         else:
-            return JaxFrame(result)
-    
+            result = {}
+            var_op = get_reduction_op('var', axis=axis)
+            for col_name in self._numeric_columns:
+                result[col_name] = var_op(self.data[col_name])
+            return self._wrap_eager_result(result)
+
     @auto_jit
     def _apply_binary_op(self, col1_data: Array, col2_data: Array, op: str) -> Array:
         """Apply a binary operation to two columns."""
         op_fn = get_binary_op(op)
         return op_fn(col1_data, col2_data)
-    
+
     def apply_rowwise(self, func, axis=1):
         """Apply a function row-wise using vmap for massive speedup."""
         if axis != 1:
             raise NotImplementedError("Only row-wise operations (axis=1) are currently supported")
-        
+
         # Collect numeric columns
-        numeric_cols = [col for col in self.columns if self._dtypes[col] != 'object']
+        numeric_cols = [col for col in self.columns if self._dtypes[col] not in {'object', 'string'}]
         if not numeric_cols:
             raise ValueError("No numeric columns found for row-wise operation")
-        
+
         # Stack numeric data
         numeric_data = jnp.stack([self.data[col] for col in numeric_cols], axis=1)
-        
+
         # Create and JIT-compile the vmapped function
         vmapped_func = jax.jit(jax.vmap(func))
-        
+
         # Apply the function
         result = vmapped_func(numeric_data)
-        
+
         from .series import JaxSeries
         return JaxSeries(result, name='result')
-    
+
     def __repr__(self) -> str:
         """Return string representation."""
         if self._lazy:
@@ -517,7 +614,7 @@ class JaxFrame:
 
         return plan_str
 
-    def _execute_plan(self, plan: LogicalPlan) -> Dict[str, Union[Array, np.ndarray]]:
+    def _execute_plan(self, plan: LogicalPlan) -> dict[str, Array | np.ndarray]:
         """Execute a logical plan and return resulting data.
 
         Parameters
@@ -650,15 +747,14 @@ class JaxFrame:
 
         elif isinstance(plan, SortPlan):
             # Import here to avoid circular dependency
-            from ..distributed.parallel_algorithms import ParallelRadixSort, ShardingSpec
-            from jax.sharding import Mesh
+            from ..distributed.parallel_algorithms import (
+                ParallelRadixSort,
+            )
 
             # Execute child plan
             input_data = self._execute_plan(plan.child)
 
-            # Create sharding spec for sorting
-            mesh = Mesh(jax.devices()[:1], axis_names=('devices',))
-            sharding_spec = ShardingSpec(mesh=mesh, row_sharding=False)
+            sharding_spec = self._resolve_execution_sharding()
             sorter = ParallelRadixSort(sharding_spec)
 
             if len(plan.sort_columns) == 1:
@@ -747,16 +843,15 @@ class JaxFrame:
 
         elif isinstance(plan, JoinPlan):
             # Import here to avoid circular dependency
-            from ..distributed.parallel_algorithms import ParallelSortMergeJoin, ShardingSpec
-            from jax.sharding import Mesh
+            from ..distributed.parallel_algorithms import (
+                ParallelSortMergeJoin,
+            )
 
             # Execute both child plans
             left_data = self._execute_plan(plan.left)
             right_data = self._execute_plan(plan.right)
 
-            # Create sharding spec
-            mesh = Mesh(jax.devices()[:1], axis_names=('devices',))
-            sharding_spec = ShardingSpec(mesh=mesh, row_sharding=False)
+            sharding_spec = self._resolve_execution_sharding()
             joiner = ParallelSortMergeJoin(sharding_spec)
 
             # Prepare value dictionaries (excluding join keys)
@@ -830,7 +925,7 @@ class JaxFrame:
 
         else:
             raise ValueError(f"Unknown plan type: {type(plan)}")
-    
+
     def __add__(self, other):
         """Addition operation."""
         # Lazy mode
@@ -857,22 +952,22 @@ class JaxFrame:
         if isinstance(other, (int, float, np.number)):
             # Scalar addition
             for col in self.columns:
-                if self._dtypes[col] != 'object':
+                if self._dtypes[col] not in {'object', 'string'}:
                     result_data[col] = self.data[col] + other
                 else:
                     result_data[col] = self.data[col]
         elif isinstance(other, JaxFrame):
             # DataFrame addition
             for col in self.columns:
-                if col in other.columns and self._dtypes[col] != 'object':
+                if col in other.columns and self._dtypes[col] not in {'object', 'string'}:
                     result_data[col] = self.data[col] + other.data[col]
                 else:
                     result_data[col] = self.data[col]
         else:
             return NotImplemented
 
-        return JaxFrame(result_data, index=self.index)
-    
+        return self._wrap_eager_result(result_data, dtypes=self._dtypes.copy())
+
     def __sub__(self, other):
         """Subtraction operation."""
         # Lazy mode
@@ -896,22 +991,22 @@ class JaxFrame:
         if isinstance(other, (int, float, np.number)):
             # Scalar subtraction
             for col in self.columns:
-                if self._dtypes[col] != 'object':
+                if self._dtypes[col] not in {'object', 'string'}:
                     result_data[col] = self.data[col] - other
                 else:
                     result_data[col] = self.data[col]
         elif isinstance(other, JaxFrame):
             # DataFrame subtraction
             for col in self.columns:
-                if col in other.columns and self._dtypes[col] != 'object':
+                if col in other.columns and self._dtypes[col] not in {'object', 'string'}:
                     result_data[col] = self.data[col] - other.data[col]
                 else:
                     result_data[col] = self.data[col]
         else:
             return NotImplemented
 
-        return JaxFrame(result_data, index=self.index)
-    
+        return self._wrap_eager_result(result_data, dtypes=self._dtypes.copy())
+
     def __mul__(self, other):
         """Multiplication operation."""
         # Lazy mode
@@ -935,22 +1030,22 @@ class JaxFrame:
         if isinstance(other, (int, float, np.number)):
             # Scalar multiplication
             for col in self.columns:
-                if self._dtypes[col] != 'object':
+                if self._dtypes[col] not in {'object', 'string'}:
                     result_data[col] = self.data[col] * other
                 else:
                     result_data[col] = self.data[col]
         elif isinstance(other, JaxFrame):
             # DataFrame multiplication
             for col in self.columns:
-                if col in other.columns and self._dtypes[col] != 'object':
+                if col in other.columns and self._dtypes[col] not in {'object', 'string'}:
                     result_data[col] = self.data[col] * other.data[col]
                 else:
                     result_data[col] = self.data[col]
         else:
             return NotImplemented
 
-        return JaxFrame(result_data, index=self.index)
-    
+        return self._wrap_eager_result(result_data, dtypes=self._dtypes.copy())
+
     def __truediv__(self, other):
         """Division operation."""
         # Lazy mode
@@ -974,55 +1069,55 @@ class JaxFrame:
         if isinstance(other, (int, float, np.number)):
             # Scalar division
             for col in self.columns:
-                if self._dtypes[col] != 'object':
+                if self._dtypes[col] not in {'object', 'string'}:
                     result_data[col] = self.data[col] / other
                 else:
                     result_data[col] = self.data[col]
         elif isinstance(other, JaxFrame):
             # DataFrame division
             for col in self.columns:
-                if col in other.columns and self._dtypes[col] != 'object':
+                if col in other.columns and self._dtypes[col] not in {'object', 'string'}:
                     result_data[col] = self.data[col] / other.data[col]
                 else:
                     result_data[col] = self.data[col]
         else:
             return NotImplemented
 
-        return JaxFrame(result_data, index=self.index)
-    
+        return self._wrap_eager_result(result_data, dtypes=self._dtypes.copy())
+
     def __radd__(self, other):
         """Right addition."""
         return self.__add__(other)
-    
+
     def __rsub__(self, other):
         """Right subtraction."""
         result_data = {}
         if isinstance(other, (int, float, np.number)):
             for col in self.columns:
-                if self._dtypes[col] != 'object':
+                if self._dtypes[col] not in {'object', 'string'}:
                     result_data[col] = other - self.data[col]
                 else:
                     result_data[col] = self.data[col]
-            return JaxFrame(result_data, index=self.index)
+            return self._wrap_eager_result(result_data, dtypes=self._dtypes.copy())
         return NotImplemented
-    
+
     def __rmul__(self, other):
         """Right multiplication."""
         return self.__mul__(other)
-    
+
     def __rtruediv__(self, other):
         """Right division."""
         result_data = {}
         if isinstance(other, (int, float, np.number)):
             for col in self.columns:
-                if self._dtypes[col] != 'object':
+                if self._dtypes[col] not in {'object', 'string'}:
                     result_data[col] = other / self.data[col]
                 else:
                     result_data[col] = self.data[col]
-            return JaxFrame(result_data, index=self.index)
+            return self._wrap_eager_result(result_data, dtypes=self._dtypes.copy())
         return NotImplemented
-    
-    def sort_values(self, by: Union[str, List[str]], ascending: Union[bool, List[bool]] = True) -> 'JaxFrame':
+
+    def sort_values(self, by: str | list[str], ascending: bool | list[bool] = True) -> 'JaxFrame':
         """
         Sort DataFrame by specified column(s).
 
@@ -1061,52 +1156,60 @@ class JaxFrame:
             if self._dtypes[col] == 'object':
                 raise TypeError(f"Cannot sort by object dtype column '{col}'")
 
-        # Import here to avoid circular dependency
-        from ..distributed.parallel_algorithms import ParallelRadixSort, ShardingSpec
-        from jax.sharding import Mesh
-
-        # Create sharding spec for sorting
-        mesh = Mesh(jax.devices()[:1], axis_names=('devices',))
-        sharding_spec = ShardingSpec(mesh=mesh, row_sharding=False)
-        sorter = ParallelRadixSort(sharding_spec)
-        
         if len(by) == 1:
             # Single column sort
             sort_col = by[0]
-            keys = self.data[sort_col]
-            
-            # Create array of row indices to track reordering
-            row_indices = jnp.arange(len(keys))
-            
-            # Perform parallel sort
-            sorted_keys, sorted_indices = sorter.sort(
-                keys, 
-                values=row_indices,
-                ascending=ascending if isinstance(ascending, bool) else ascending[0]
-            )
+            ascending_flag = ascending if isinstance(ascending, bool) else ascending[0]
+            if self._dtypes[sort_col] == 'string':
+                sort_keys = sortable_string_codes(
+                    self.data[sort_col],
+                    self._string_vocabs[sort_col],
+                    descending=not ascending_flag,
+                )
+                sorted_indices = jnp.argsort(sort_keys, stable=True)
+            else:
+                from ..distributed.parallel_algorithms import ParallelRadixSort
+
+                keys = self.data[sort_col]
+                row_indices = jnp.arange(len(keys))
+                sharding_spec = self._resolve_execution_sharding()
+                sorter = ParallelRadixSort(sharding_spec)
+                _, sorted_indices = sorter.sort(
+                    keys,
+                    values=row_indices,
+                    ascending=ascending_flag
+                )
         else:
             # Multi-column sort
+            if any(self._dtypes[col] == 'string' for col in by):
+                raise NotImplementedError("Multi-column sorting with string columns is not yet implemented")
+
+            from ..distributed.parallel_algorithms import ParallelRadixSort
+
+            sharding_spec = self._resolve_execution_sharding()
+            sorter = ParallelRadixSort(sharding_spec)
             keys = [self.data[col] for col in by]
-            
+
             # Prepare values dict with all other columns
             values_dict = {col: self.data[col] for col in self.columns if col not in by}
-            
+
             # Perform multi-column sort
             sorted_keys, sorted_values = sorter.sort_multi_column(
                 keys,
                 values=values_dict,
                 ascending=ascending
             )
-            
+
             # Combine sorted keys and values
             result_data = {}
             for i, col in enumerate(by):
                 result_data[col] = sorted_keys[i]
             if sorted_values:
                 result_data.update(sorted_values)
-            
-            return JaxFrame(result_data, index=None)
-        
+
+            result_dtypes = {col: self._dtypes.get(col, self._infer_dtype_name(arr)) for col, arr in result_data.items()}
+            return self._wrap_eager_result(result_data, index=None, dtypes=result_dtypes)
+
         # For single column, reorder all columns based on sorted indices
         result_data = {}
         for col in self.columns:
@@ -1116,10 +1219,10 @@ class JaxFrame:
             else:
                 # Reorder object arrays
                 result_data[col] = self.data[col][sorted_indices]
-        
-        return JaxFrame(result_data, index=None)
-    
-    def groupby(self, by: Union[str, List[str]]) -> 'GroupBy':
+
+        return self._wrap_eager_result(result_data, index=None, dtypes=self._dtypes.copy())
+
+    def groupby(self, by: str | list[str]) -> 'GroupBy':
         """
         Group DataFrame by specified column(s).
         
@@ -1134,8 +1237,7 @@ class JaxFrame:
             GroupBy object for aggregation
         """
         # Import here to avoid circular dependency
-        from ..distributed.frame import GroupBy as DistGroupBy
-        
+
         # Use a simple wrapper that works for both distributed and non-distributed
         class GroupBy:
             def __init__(self, frame, by):
@@ -1148,7 +1250,7 @@ class JaxFrame:
                     # Only check dtypes for eager frames
                     if not self.frame._lazy and self.frame._dtypes[col] == 'object':
                         raise TypeError(f"Cannot group by object dtype column '{col}'")
-            
+
             def agg(self, agg_funcs):
                 # Prepare aggregation functions
                 if isinstance(agg_funcs, str):
@@ -1162,7 +1264,7 @@ class JaxFrame:
                     else:
                         # For eager frames, get columns from dtypes
                         for col in self.frame.columns:
-                            if col not in self.by and self.frame._dtypes[col] != 'object':
+                            if col not in self.by and self.frame._dtypes[col] not in {'object', 'string'}:
                                 agg_dict[col] = agg_funcs
                 else:
                     agg_dict = agg_funcs
@@ -1177,24 +1279,37 @@ class JaxFrame:
                     return JaxFrame(data=None, index=self.frame.index, lazy=True, plan=new_plan)
 
                 # Eager mode
-                from ..distributed import parallel_algorithms
-
                 # Prepare keys and values
                 if len(self.by) == 1:
                     # Single column groupby - use wrapper function
                     group_col = self.by[0]
                     keys = self.frame.data[group_col]
                     values = {col: self.frame.data[col] for col in agg_dict.keys()}
+                    if can_use_string_groupby_fastpath(
+                        self.frame._dtypes[group_col],
+                        agg_dict,
+                        self.frame._dtypes,
+                    ):
+                        unique_keys, aggregated = groupby_encoded_strings(
+                            keys,
+                            values,
+                            agg_dict,
+                            vocab_size=len(self.frame._string_vocabs[group_col]),
+                        )
+                    else:
+                        from ..distributed import parallel_algorithms
 
-                    # Use the wrapper function that handles cleanup
-                    unique_keys, aggregated = parallel_algorithms.groupby_aggregate(
-                        keys, values, agg_dict
-                    )
+                        unique_keys, aggregated = parallel_algorithms.groupby_aggregate(
+                            keys, values, agg_dict
+                        )
 
                     result_data = {group_col: unique_keys}
                     result_data.update(aggregated)
+                    result_string_vocabs = {group_col: self.frame._string_vocabs[group_col]} if group_col in self.frame._string_vocabs else {}
                 else:
                     # Multi-column groupby - use wrapper function
+                    from ..distributed import parallel_algorithms
+
                     keys = [self.frame.data[col] for col in self.by]
                     values = {col: self.frame.data[col] for col in agg_dict.keys()}
 
@@ -1205,30 +1320,41 @@ class JaxFrame:
 
                     result_data = unique_key_dict
                     result_data.update(aggregated)
+                    result_string_vocabs = {
+                        col: self.frame._string_vocabs[col]
+                        for col in self.by
+                        if col in self.frame._string_vocabs
+                    }
 
-                return JaxFrame(result_data, index=None)
-            
+                result_dtypes = {col: self.frame._dtypes.get(col, self.frame._infer_dtype_name(arr)) for col, arr in result_data.items()}
+                return self.frame._wrap_eager_result(
+                    result_data,
+                    index=None,
+                    dtypes=result_dtypes,
+                    string_vocabs=result_string_vocabs,
+                )
+
             def sum(self):
                 return self.agg('sum')
-            
+
             def mean(self):
                 return self.agg('mean')
-            
+
             def max(self):
                 return self.agg('max')
-            
+
             def min(self):
                 return self.agg('min')
-            
+
             def count(self):
                 return self.agg('count')
-        
+
         return GroupBy(self, by)
-    
+
     def merge(
         self,
         other: 'JaxFrame',
-        on: Union[str, List[str]],
+        on: str | list[str],
         how: str = 'inner'
     ) -> 'JaxFrame':
         """
@@ -1262,7 +1388,7 @@ class JaxFrame:
         # Lazy mode
         if self._lazy:
             # Import here to avoid circular dependency
-            from ..lazy.plan import JoinPlan, InputPlan
+            from ..lazy.plan import InputPlan, JoinPlan
 
             # Get right plan - convert eager frame to InputPlan if needed
             if other._lazy:
@@ -1280,56 +1406,139 @@ class JaxFrame:
             )
             return JaxFrame(data=None, index=self.index, lazy=True, plan=new_plan)
 
+        string_join_vocabs: dict[str, tuple[str, ...]] = {}
+
         # Eager mode - validate types for eager execution
         for col in on:
             if self._dtypes[col] == 'object' or other._dtypes[col] == 'object':
                 raise TypeError(f"Cannot join on object dtype column '{col}'")
 
-        from ..distributed.parallel_algorithms import ParallelSortMergeJoin, ShardingSpec
-        from jax.sharding import Mesh
+        from ..distributed.parallel_algorithms import ParallelSortMergeJoin
 
-        # Create sharding spec
-        mesh = Mesh(jax.devices()[:1], axis_names=('devices',))
-        sharding_spec = ShardingSpec(mesh=mesh, row_sharding=False)
+        sharding_spec = self._resolve_execution_sharding(other)
         joiner = ParallelSortMergeJoin(sharding_spec)
-        
+
         # Prepare value dictionaries (excluding join keys)
         left_values = {col: self.data[col] for col in self.columns if col not in on}
         right_values = {col: other.data[col] for col in other.columns if col not in on}
-        
+
+        if (
+            len(on) == 1
+            and can_use_string_join_fastpath(
+                self._dtypes[on[0]],
+                {col: self._dtypes[col] for col in left_values},
+                {col: other._dtypes[col] for col in right_values},
+                how,
+            )
+        ):
+            join_col = on[0]
+            left_keys, right_keys, merged_vocab = align_string_code_arrays(
+                self.data[join_col],
+                self._string_vocabs[join_col],
+                other.data[join_col],
+                other._string_vocabs[join_col],
+            )
+            join_plan = join_encoded_strings(
+                left_keys,
+                right_keys,
+                num_codes=len(merged_vocab),
+                how=how,
+            )
+            result_data, result_dtypes, result_string_vocabs = assemble_string_join_payloads(
+                join_plan,
+                left_values,
+                right_values,
+                {col: self._dtypes[col] for col in left_values},
+                {col: other._dtypes[col] for col in right_values},
+            )
+            result_data = {join_col: result_data.pop("key_codes"), **result_data}
+            result_dtypes = {join_col: "string", **result_dtypes}
+            result_dtypes.pop("key_codes", None)
+            result_string_vocabs = {
+                join_col: merged_vocab,
+                **{
+                    f"left_{col}": self._string_vocabs[col]
+                    for col in left_values
+                    if col in self._string_vocabs
+                },
+                **{
+                    f"right_{col}": other._string_vocabs[col]
+                    for col in right_values
+                    if col in other._string_vocabs
+                },
+            }
+            return self._wrap_eager_result(
+                result_data,
+                index=None,
+                dtypes=result_dtypes,
+                string_vocabs=result_string_vocabs,
+            )
+
         if len(on) == 1:
             # Single column join
             join_col = on[0]
             left_keys = self.data[join_col]
             right_keys = other.data[join_col]
-            
+            if self._dtypes[join_col] == 'string':
+                left_keys, right_keys, merged_vocab = align_string_code_arrays(
+                    left_keys,
+                    self._string_vocabs[join_col],
+                    right_keys,
+                    other._string_vocabs[join_col],
+                )
+                string_join_vocabs[join_col] = merged_vocab
+
             # Perform parallel sort-merge join
             joined_keys, joined_values = joiner.join(
                 left_keys, left_values,
                 right_keys, right_values,
                 how=how
             )
-            
+
             # Combine keys and values into result
             result_data = {join_col: joined_keys}
             result_data.update(joined_values)
         else:
             # Multi-column join
-            left_keys = [self.data[col] for col in on]
-            right_keys = [other.data[col] for col in on]
-            
+            left_keys = []
+            right_keys = []
+            for col in on:
+                left_key = self.data[col]
+                right_key = other.data[col]
+                if self._dtypes[col] == 'string':
+                    left_key, right_key, merged_vocab = align_string_code_arrays(
+                        left_key,
+                        self._string_vocabs[col],
+                        right_key,
+                        other._string_vocabs[col],
+                    )
+                    string_join_vocabs[col] = merged_vocab
+                left_keys.append(left_key)
+                right_keys.append(right_key)
+
             # Perform multi-column join
             joined_key_dict, joined_values = joiner.join_multi_column(
                 left_keys, on, left_values,
                 right_keys, on, right_values,
                 how=how
             )
-            
+
             # Combine keys and values into result
             result_data = joined_key_dict
             result_data.update(joined_values)
-        
-        return JaxFrame(result_data, index=None)
+
+        result_dtypes = {col: self._dtypes.get(col, other._dtypes.get(col, self._infer_dtype_name(arr))) for col, arr in result_data.items()}
+        result_string_vocabs = {
+            **{col: self._string_vocabs[col] for col in left_values if col in self._string_vocabs},
+            **{col: other._string_vocabs[col] for col in right_values if col in other._string_vocabs},
+            **string_join_vocabs,
+        }
+        return self._wrap_eager_result(
+            result_data,
+            index=None,
+            dtypes=result_dtypes,
+            string_vocabs=result_string_vocabs,
+        )
 
     def head(self, n: int = 5) -> 'JaxFrame':
         """
@@ -1357,7 +1566,7 @@ class JaxFrame:
                 result_data = {col: arr[:0] for col, arr in self.data.items()}
             else:
                 result_data = {col: arr[:n] for col, arr in self.data.items()}
-            return JaxFrame(data=result_data, index=None)
+            return self._wrap_eager_result(result_data, index=None, dtypes=self._dtypes.copy())
 
     def tail(self, n: int = 5) -> 'JaxFrame':
         """
@@ -1385,7 +1594,7 @@ class JaxFrame:
                 result_data = {col: arr[:0] for col, arr in self.data.items()}
             else:
                 result_data = {col: arr[-n:] for col, arr in self.data.items()}
-            return JaxFrame(data=result_data, index=None)
+            return self._wrap_eager_result(result_data, index=None, dtypes=self._dtypes.copy())
 
     def __len__(self) -> int:
         """Return the number of rows in the DataFrame."""
@@ -1398,20 +1607,21 @@ def _jaxframe_flatten(jf: JaxFrame):
     # Separate JAX arrays from object arrays
     jax_data = {}
     object_data = {}
-    
+
     for col, arr in jf.data.items():
         if isinstance(arr, (jax.Array, jnp.ndarray)) and arr.dtype != np.object_:
             jax_data[col] = arr
         else:
             object_data[col] = arr
-    
+
     # Return JAX arrays as children, everything else as auxiliary data
     children = list(jax_data.values())
     aux_data = {
         'jax_columns': list(jax_data.keys()),
         'object_data': object_data,
         'index': jf.index,
-        'dtypes': jf._dtypes
+        'dtypes': jf._dtypes,
+        'string_vocabs': jf._string_vocabs,
     }
     return children, aux_data
 
@@ -1420,18 +1630,22 @@ def _jaxframe_unflatten(aux_data, children):
     """Unflatten JaxFrame from PyTree."""
     # Reconstruct data dictionary
     data = {}
-    
+
     # Add JAX arrays back
-    for col, arr in zip(aux_data['jax_columns'], children):
+    for col, arr in zip(aux_data['jax_columns'], children, strict=False):
         data[col] = arr
-    
+
     # Add object arrays back
     data.update(aux_data['object_data'])
-    
+
     # Create new JaxFrame
-    jf = JaxFrame(data, index=aux_data['index'])
-    jf._dtypes = aux_data['dtypes']
-    return jf
+    return JaxFrame._from_processed_data(
+        data,
+        index=aux_data['index'],
+        dtypes=aux_data['dtypes'],
+        string_vocabs=aux_data.get('string_vocabs', {}),
+        validate_lengths=False,
+    )
 
 
 # Register JaxFrame as a PyTree

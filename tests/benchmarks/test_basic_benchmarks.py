@@ -1,65 +1,79 @@
 """Basic benchmark tests for JaxFrames.
 
-These benchmarks will grow as the library develops.
+These benchmarks intentionally separate:
+- host-side data generation
+- host -> device ingestion
+- constructor-only wrapping of already device-ready arrays
+- conversion back to pandas
 """
 
-import pytest
+import jax
+import jax.numpy as jnp
 import numpy as np
-import pandas as pd
-from jaxframes.testing import generate_random_frame
+import pytest
+
 from jaxframes.core import JaxFrame
 
 
+def _generate_numpy_data(nrows: int, ncols: int, seed: int = 42) -> dict[str, np.ndarray]:
+    """Create repeatable host-side numeric data."""
+    rng = np.random.RandomState(seed)
+    return {
+        f"col_{i}": rng.normal(0, 1, nrows).astype("float32")
+        for i in range(ncols)
+    }
+
+
+def _ingest_numpy_to_jax(data: dict[str, np.ndarray]) -> dict[str, jax.Array]:
+    """Convert host numpy arrays into device-ready JAX arrays."""
+    return {col: jnp.asarray(arr) for col, arr in data.items()}
+
+
+def _block_mapping(data: dict[str, jax.Array]) -> dict[str, jax.Array]:
+    """Force completion of all outstanding device transfers or kernels."""
+    for arr in data.values():
+        jax.block_until_ready(arr)
+    return data
+
+
 class TestBasicBenchmarks:
-    """Basic benchmark tests."""
-    
-    @pytest.mark.benchmark
-    def test_dataframe_creation_benchmark(self, benchmark):
-        """Benchmark DataFrame creation."""
-        
-        def create_jaxframe():
-            pandas_df, jax_data = generate_random_frame(nrows=1000, ncols=10, seed=42)
-            return JaxFrame(jax_data)
-        
-        result = benchmark(create_jaxframe)
-        assert result.shape == (1000, 10)
-    
-    @pytest.mark.benchmark  
+    """Basic benchmark tests with explicit timing modes."""
+
+    @pytest.mark.benchmark(group="generation")
+    def test_host_data_generation_benchmark(self, benchmark):
+        """Benchmark numpy-side test data generation only."""
+        result = benchmark(lambda: _generate_numpy_data(nrows=1_000, ncols=10, seed=42))
+        assert len(result) == 10
+
+    @pytest.mark.benchmark(group="ingest")
+    def test_host_to_device_ingest_benchmark(self, benchmark):
+        """Benchmark numpy -> JAX conversion only."""
+        numpy_data = _generate_numpy_data(nrows=1_000, ncols=10, seed=42)
+
+        def ingest():
+            return _block_mapping(_ingest_numpy_to_jax(numpy_data))
+
+        result = benchmark(ingest)
+        assert len(result) == 10
+
+    @pytest.mark.benchmark(group="creation")
+    def test_dataframe_constructor_only_benchmark(self, benchmark):
+        """Benchmark wrapping already device-ready arrays in a JaxFrame."""
+        jax_data = _block_mapping(_ingest_numpy_to_jax(_generate_numpy_data(nrows=1_000, ncols=10, seed=42)))
+        result = benchmark(lambda: JaxFrame(jax_data))
+        assert result.shape == (1_000, 10)
+
+    @pytest.mark.benchmark(group="conversion")
     def test_to_pandas_conversion_benchmark(self, benchmark):
-        """Benchmark conversion to pandas."""
-        
-        # Setup
-        pandas_df, jax_data = generate_random_frame(nrows=1000, ncols=10, seed=42)
-        jf = JaxFrame(jax_data)
-        
-        def convert_to_pandas():
-            return jf.to_pandas()
-        
-        result = benchmark(convert_to_pandas)
-        assert result.shape == (1000, 10)
-    
-    @pytest.mark.benchmark
-    def test_pandas_dataframe_creation_baseline(self, benchmark):
-        """Baseline benchmark for pandas DataFrame creation."""
-        
-        def create_pandas_df():
-            data = {}
-            rng = np.random.RandomState(42)
-            for i in range(10):
-                data[f"col_{i}"] = rng.normal(0, 1, 1000).astype("float32")
-            return pd.DataFrame(data)
-        
-        result = benchmark(create_pandas_df)
-        assert result.shape == (1000, 10)
-    
+        """Benchmark conversion from a device-backed JaxFrame to pandas."""
+        jf = JaxFrame(_block_mapping(_ingest_numpy_to_jax(_generate_numpy_data(nrows=1_000, ncols=10, seed=42))))
+        result = benchmark(jf.to_pandas)
+        assert result.shape == (1_000, 10)
+
     @pytest.mark.slow
-    @pytest.mark.benchmark
-    def test_large_dataframe_creation(self, benchmark):
-        """Benchmark creation of larger DataFrames."""
-        
-        def create_large_jaxframe():
-            pandas_df, jax_data = generate_random_frame(nrows=10000, ncols=50, seed=42)
-            return JaxFrame(jax_data)
-        
-        result = benchmark(create_large_jaxframe)
-        assert result.shape == (10000, 50)
+    @pytest.mark.benchmark(group="creation")
+    def test_large_dataframe_constructor_only(self, benchmark):
+        """Benchmark larger constructor-only wrapping costs."""
+        jax_data = _block_mapping(_ingest_numpy_to_jax(_generate_numpy_data(nrows=10_000, ncols=50, seed=42)))
+        result = benchmark(lambda: JaxFrame(jax_data))
+        assert result.shape == (10_000, 50)

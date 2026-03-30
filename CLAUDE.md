@@ -11,8 +11,8 @@ JaxFrames is a pandas-compatible DataFrame library that runs natively on TPUs us
 ## Development Commands
 
 ```bash
-# Install dependencies (uses UV package manager)
-uv install
+# Install/sync dependencies (uses UV package manager)
+uv sync
 
 # Run all tests
 uv run pytest
@@ -37,7 +37,6 @@ uv run pytest tests/benchmarks/ -v --benchmark-only
 
 # Run benchmarks with custom analysis
 python run_benchmarks.py
-python benchmark_analysis.py  # Analyze benchmark results
 python benchmark_warmed.py    # Benchmark with warmed JIT cache
 
 # Code formatting
@@ -82,9 +81,16 @@ examples/
   basic_usage.py            # Simple JaxFrame examples
   auto_jit_example.py       # JIT compilation demonstrations
   distributed_example.py    # Multi-device execution examples
+  lazy_execution_example.py # Lazy execution demonstrations
+  optimizer_example.py      # Query optimizer demonstrations
+
+docs/
+  DISTRIBUTED.md            # Distributed execution guide
+  LAZY_EXECUTION.md         # Lazy execution guide and best practices
+  OPTIMIZER.md              # Query optimizer documentation
 ```
 
-### 5-Layer Architecture
+### Architecture Layers
 
 1. **API Layer** (`src/jaxframes/core/`): User-facing JaxFrame/JaxSeries classes
    - `frame.py`: Main JaxFrame class with pandas-like API
@@ -106,6 +112,7 @@ examples/
 3. **Lazy Execution Layer** (`src/jaxframes/lazy/`): Query planning and optimization
    - `plan.py`: Logical plan representation (InputPlan, FilterPlan, ProjectPlan, etc.)
    - `expressions.py`: Expression system for building query trees
+   - `builder.py`: Query plan builder utilities
    - `optimizer.py`: Query optimizer with multiple optimization passes
    - `rules.py`: Cost-based optimization rules
    - `codegen.py`: Code generation (logical plan → JAX code)
@@ -117,7 +124,9 @@ examples/
 4. **Distributed Layer** (`src/jaxframes/distributed/`): Multi-device execution
    - `frame.py`: DistributedJaxFrame extending base with sharding support
    - `sharding.py`: Device mesh management and sharding specifications
+   - `sharding_utils.py`: Sharding utility helpers
    - `parallel_algorithms.py`: Core parallel algorithms (radix sort, groupby, joins)
+   - `fast_algorithms.py`: Optimized algorithm variants
    - `operations.py`: Distributed operations using JAX collectives
    - `padding.py`: Automatic array padding for multi-device compatibility
    - `multi_column_distributed.py`: Multi-column operations on distributed data
@@ -195,82 +204,17 @@ The repository includes extensive planning and architecture documentation:
 - **PLAN.md**: Detailed implementation roadmap with stage-by-stage breakdown and current status
 - **DETAILS.md**: Comprehensive architectural blueprint explaining design decisions and technical approach
 - **README.md**: High-level project vision and getting started guide
+- **GOAL.md**: Project goals and vision
+- **INSTALL.md**: Installation instructions
 - **AUTO_JIT.md**: Documentation of the automatic JIT compilation system (Stage 1)
 - **BENCHMARKS.md**: Performance benchmarking methodology and results
 - **STRINGPLAN.md**: Design notes for string operations (deferred feature)
+- **docs/**: Additional guides (DISTRIBUTED.md, LAZY_EXECUTION.md, OPTIMIZER.md)
 
 ## API Compatibility Status
 
-**Implemented**:
-- **Basic operations**: `+`, `-`, `*`, `/`, column selection, assignment
-- **Reductions**: `sum()`, `mean()`, `max()`, `min()`, `std()`, `var()`
-- **Sorting**: `sort_values()` (multi-column with mixed ascending/descending, numerical only)
-- **GroupBy**: `groupby().agg()` with sum, mean, max, min, count (multi-column support)
-- **Joins**: `merge()` with inner, left, right, outer (multi-column support, numerical only)
-- **Lazy execution mode**: Build query plans that are optimized before execution
-  - `.collect()`: Trigger execution of lazy query plan
-  - `.explain()`: View query plan and optimization details
-- **Expression API**: Composable expressions for lazy evaluation
-  - Column references: `col('column_name')`
-  - Literals: `lit(value)`
-  - Binary operations: `+`, `-`, `*`, `/`, `//`, `%`, `**`
-  - Comparisons: `>`, `<`, `>=`, `<=`, `==`, `!=`
-  - Mathematical functions: `sqrt()`, `exp()`, `log()`, `sin()`, `cos()`, etc.
-  - Aggregations: `sum_()`, `mean()`, `count()`, `min_()`, `max_()`, etc.
-  - Aliasing: `.alias('name')`
-  - Type casting: `.cast(dtype)`
-- **Query optimization**: Automatic optimization of lazy query plans
-  - Predicate pushdown: Move filters closer to data sources
-  - Projection pushdown: Only compute required columns
-  - Constant folding: Pre-compute constant expressions
-  - Expression simplification: Simplify complex expressions
-  - Operation fusion: Combine compatible operations
+**Implemented**: Basic arithmetic, column selection/assignment, reductions (`sum`, `mean`, `max`, `min`, `std`, `var`), `sort_values()`, `groupby().agg()`, `merge()` (inner/left/right/outer joins), lazy execution with expression API (`col()`, `lit()`, binary/comparison/unary ops, aggregations, `.alias()`, `.cast()`), and query optimization (predicate/projection pushdown, constant folding, expression simplification, operation fusion).
 
-**Not Yet Implemented**:
-- String operations (framework exists in git history if needed)
-- Window functions
-- Time series operations
-- I/O operations (Parquet, CSV)
+**Not yet implemented**: String operations, window functions, time series, I/O (Parquet, CSV).
 
-## Using Lazy Execution
-
-JaxFrames supports both **eager** (default) and **lazy** execution modes:
-
-### Eager Mode (Default)
-Operations execute immediately, returning results:
-```python
-df = jf.DataFrame({'a': [1, 2, 3], 'b': [4, 5, 6]})
-result = df[df['a'] > 1].sum()  # Executes immediately
-```
-
-### Lazy Mode
-Operations build a query plan that is optimized before execution:
-```python
-# Create lazy frame
-df = jf.DataFrame({'a': [1, 2, 3], 'b': [4, 5, 6]}, lazy=True)
-
-# Build query plan (no execution yet)
-query = (df
-    .filter(col('a') > 1)
-    .select([col('a'), col('b') * 2])
-    .groupby('a')
-    .agg({'b': 'sum'}))
-
-# View the optimized query plan
-print(query.explain())
-
-# Trigger execution and get results
-result = query.collect()
-```
-
-### When to Use Lazy Mode
-- **Complex queries**: Multiple filters, joins, and aggregations benefit from optimization
-- **Large datasets**: Query optimization can significantly reduce computation
-- **Debugging**: Use `.explain()` to understand query execution plans
-- **Performance tuning**: Identify optimization opportunities
-
-### Key Methods
-- **`.collect()`**: Execute the lazy query plan and return results
-- **`.explain(verbose=False)`**: Display the query plan (set `verbose=True` for optimization details)
-
-See `docs/LAZY_EXECUTION.md` for comprehensive guide and best practices.
+See `docs/LAZY_EXECUTION.md` for lazy execution guide and `docs/OPTIMIZER.md` for query optimization details.

@@ -11,20 +11,18 @@ These algorithms form the foundation for efficient distributed DataFrame operati
 on TPUs and GPUs.
 """
 
-from typing import Dict, Optional, Union, Tuple, List, Any, Callable
 import jax
 import jax.numpy as jnp
-from jax import Array
-from jax.sharding import NamedSharding, PartitionSpec as P, Mesh
-from jax.experimental.shard_map import shard_map
-from jax.lax import psum, pmax, pmin, all_to_all, scan
-from jax import pmap, vmap
 import numpy as np
+from jax import Array
+from jax.experimental.shard_map import shard_map
+from jax.sharding import Mesh
+from jax.sharding import PartitionSpec as P
 
 from .sharding import ShardingSpec
 
 
-def multi_column_lexsort(keys: List[Array], ascending: Union[bool, List[bool]] = True) -> Array:
+def multi_column_lexsort(keys: list[Array], ascending: bool | list[bool] = True) -> Array:
     """
     Get indices that would sort multiple arrays lexicographically.
     
@@ -45,16 +43,16 @@ def multi_column_lexsort(keys: List[Array], ascending: Union[bool, List[bool]] =
     """
     if len(keys) == 1:
         return jnp.argsort(keys[0], stable=True)
-    
+
     # Handle ascending parameter
     if isinstance(ascending, bool):
         ascending = [ascending] * len(keys)
-    
+
     n = len(keys[0])
     indices = jnp.arange(n)
-    
+
     # Sort by each column from last to first (stable sort preserves order)
-    for arr, asc in zip(reversed(keys), reversed(ascending)):
+    for arr, asc in zip(reversed(keys), reversed(ascending), strict=False):
         if not asc:
             # For descending, negate numerics or use reverse indices
             if arr.dtype in [jnp.float32, jnp.float64]:
@@ -64,11 +62,11 @@ def multi_column_lexsort(keys: List[Array], ascending: Union[bool, List[bool]] =
         # Use stable=True to preserve previous orderings
         sort_idx = jnp.argsort(arr[indices], stable=True)
         indices = indices[sort_idx]
-    
+
     return indices
 
 
-def hash_multi_columns(keys: List[Array]) -> Array:
+def hash_multi_columns(keys: list[Array]) -> Array:
     """
     Create a hash for multiple columns that preserves uniqueness.
     
@@ -93,7 +91,7 @@ def hash_multi_columns(keys: List[Array]) -> Array:
             key_int = key.view(jnp.uint32 if key.dtype == jnp.float32 else jnp.uint32)
         else:
             key_int = key.astype(jnp.uint32)
-        
+
         # Apply mixing for better distribution
         key_int = key_int ^ (key_int >> 16)
         key_int = key_int * jnp.uint32(0x85ebca6b)
@@ -101,15 +99,15 @@ def hash_multi_columns(keys: List[Array]) -> Array:
         key_int = key_int * jnp.uint32(0xc2b2ae35)
         key_int = key_int ^ (key_int >> 16)
         return key_int
-    
+
     # Use polynomial rolling hash with better mixing
     # Different primes for better distribution
     PRIME1 = jnp.uint32(0x9e3779b1)  # Golden ratio prime
     PRIME2 = jnp.uint32(0x85ebca6b)  # Another good mixing prime
-    
+
     # Start with a seed value
     hash_vals = jnp.uint32(0x1337)  # Non-zero seed
-    
+
     for i, key in enumerate(keys):
         # Convert to integers if needed
         if key.dtype in [jnp.float32, jnp.float64]:
@@ -121,24 +119,24 @@ def hash_multi_columns(keys: List[Array]) -> Array:
                 key_int = key.astype(jnp.float32).view(jnp.uint32)
         else:
             key_int = key.astype(jnp.uint32)
-        
+
         # Mix in the key with rotation and XOR for better distribution
         # Use different prime multipliers for each position
         hash_vals = hash_vals ^ (key_int * (PRIME1 + jnp.uint32(i)))
         hash_vals = ((hash_vals << 13) | (hash_vals >> 19))  # Rotate
         hash_vals = hash_vals * PRIME2
-    
+
     # Final mixing for better distribution
     hash_vals = hash_vals ^ (hash_vals >> 16)
     hash_vals = hash_vals * jnp.uint32(0x85ebca6b)
     hash_vals = hash_vals ^ (hash_vals >> 13)
     hash_vals = hash_vals * jnp.uint32(0xc2b2ae35)
     hash_vals = hash_vals ^ (hash_vals >> 16)
-    
+
     return hash_vals
 
 
-def combine_keys_for_sorting(keys: List[Array]) -> Array:
+def combine_keys_for_sorting(keys: list[Array]) -> Array:
     """
     Legacy function - redirects to multi_column_lexsort for compatibility.
     """
@@ -149,6 +147,152 @@ def combine_keys_for_sorting(keys: List[Array]) -> Array:
     return ranks
 
 
+def _logical_pad_value(dtype_name: str, arr: Array) -> Array | float | int | bool:
+    """Return a per-column pad value for collective bucketization."""
+    if dtype_name == "string":
+        return jnp.asarray(-1, dtype=arr.dtype)
+    if jnp.issubdtype(arr.dtype, jnp.floating):
+        return jnp.asarray(jnp.nan, dtype=arr.dtype)
+    if jnp.issubdtype(arr.dtype, jnp.integer):
+        return jnp.asarray(-999999, dtype=arr.dtype)
+    if arr.dtype == jnp.bool_:
+        return jnp.asarray(False, dtype=arr.dtype)
+    return jnp.asarray(0, dtype=arr.dtype)
+
+
+def _bucketize_local_column(
+    arr: Array,
+    targets: Array,
+    num_devices: int,
+    pad_value: Array | float | int | bool,
+) -> Array:
+    """Pack one local column into fixed-capacity per-destination buckets."""
+    local_n = arr.shape[0]
+    sort_idx = jnp.argsort(targets, stable=True)
+    sorted_targets = targets[sort_idx]
+    sorted_arr = arr[sort_idx]
+    counts = jnp.bincount(sorted_targets, length=num_devices)
+    starts = jnp.concatenate(
+        [jnp.zeros(1, dtype=jnp.int32), jnp.cumsum(counts[:-1], dtype=jnp.int32)]
+    )
+    local_positions = jnp.arange(local_n, dtype=jnp.int32) - starts[sorted_targets]
+
+    bucket_shape = (num_devices, local_n) + arr.shape[1:]
+    buckets = jnp.full(bucket_shape, pad_value, dtype=arr.dtype)
+    return buckets.at[sorted_targets, local_positions].set(sorted_arr)
+
+
+def collective_hash_repartition(
+    keys: list[Array],
+    values: dict[str, Array],
+    key_dtypes: dict[str, str] | None = None,
+    value_dtypes: dict[str, str] | None = None,
+    sharding_spec: ShardingSpec | None = None,
+) -> tuple[list[Array], dict[str, Array], Array]:
+    """
+    Repartition rows across devices by composite-key hash using device collectives.
+
+    Returns oversized compactable arrays plus a validity mask. The compacted row
+    order is partition-oriented rather than user-visible and is intended only as
+    a preprocessing step before distributed join/groupby kernels.
+    """
+    if not keys:
+        return keys, values, jnp.asarray([], dtype=bool)
+
+    if sharding_spec is None or sharding_spec.mesh.size == 1 or not sharding_spec.row_sharding:
+        return keys, values, jnp.ones(keys[0].shape[0], dtype=bool)
+
+    axis_name = sharding_spec.row_sharding
+    mesh = sharding_spec.mesh
+    num_devices = mesh.size
+    key_dtypes = key_dtypes or {str(i): str(key.dtype) for i, key in enumerate(keys)}
+    value_dtypes = value_dtypes or {name: str(arr.dtype) for name, arr in values.items()}
+    key_names = list(key_dtypes.keys())
+    value_names = list(values.keys())
+
+    def repartition_local(local_keys, local_values):
+        local_targets = (hash_multi_columns(list(local_keys)) % num_devices).astype(jnp.int32)
+
+        bucketed_keys = []
+        for key_name, local_key in zip(key_names, local_keys, strict=False):
+            bucketed = _bucketize_local_column(
+                local_key,
+                local_targets,
+                num_devices,
+                _logical_pad_value(key_dtypes[key_name], local_key),
+            )
+            redistributed = jax.lax.all_to_all(
+                bucketed,
+                axis_name=axis_name,
+                split_axis=0,
+                concat_axis=0,
+            )
+            bucketed_keys.append(redistributed.reshape(-1, *local_key.shape[1:]))
+
+        bucketed_values = {}
+        for value_name in value_names:
+            local_value = local_values[value_name]
+            bucketed = _bucketize_local_column(
+                local_value,
+                local_targets,
+                num_devices,
+                _logical_pad_value(value_dtypes[value_name], local_value),
+            )
+            redistributed = jax.lax.all_to_all(
+                bucketed,
+                axis_name=axis_name,
+                split_axis=0,
+                concat_axis=0,
+            )
+            bucketed_values[value_name] = redistributed.reshape(-1, *local_value.shape[1:])
+
+        valid_bucket = _bucketize_local_column(
+            jnp.ones(local_targets.shape[0], dtype=jnp.bool_),
+            local_targets,
+            num_devices,
+            jnp.asarray(False, dtype=jnp.bool_),
+        )
+        redistributed_valid = jax.lax.all_to_all(
+            valid_bucket,
+            axis_name=axis_name,
+            split_axis=0,
+            concat_axis=0,
+        ).reshape(-1)
+
+        return bucketed_keys, bucketed_values, redistributed_valid
+
+    key_specs = tuple(P(axis_name) for _ in keys)
+    value_specs = {name: P(axis_name) for name in value_names}
+    shuffled_keys, shuffled_values, valid_mask = shard_map(
+        repartition_local,
+        mesh=mesh,
+        in_specs=(key_specs, value_specs),
+        out_specs=(key_specs, value_specs, P(axis_name)),
+        check_rep=False,
+    )(tuple(keys), values)
+
+    return list(shuffled_keys), shuffled_values, valid_mask
+
+
+def compact_repartitioned_rows(
+    keys: list[Array],
+    values: dict[str, Array],
+    valid_mask: Array,
+) -> tuple[list[Array], dict[str, Array]]:
+    """Compact oversized repartition buffers back down to valid rows only."""
+    if valid_mask.size == 0:
+        return keys, values
+
+    num_valid = int(np.asarray(jnp.sum(valid_mask)))
+    if num_valid == valid_mask.shape[0]:
+        return keys, values
+
+    positions = jnp.nonzero(valid_mask, size=valid_mask.shape[0], fill_value=0)[0][:num_valid]
+    compact_keys = [key[positions] for key in keys]
+    compact_values = {name: arr[positions] for name, arr in values.items()}
+    return compact_keys, compact_values
+
+
 class ParallelRadixSort:
     """
     Massively parallel radix sort implementation for distributed arrays.
@@ -156,7 +300,7 @@ class ParallelRadixSort:
     This is the cornerstone algorithm that enables efficient groupby and join operations.
     Uses a multi-pass approach with local histogram calculation and global redistribution.
     """
-    
+
     def __init__(self, sharding_spec: ShardingSpec, bits_per_pass: int = 8):
         """
         Initialize the parallel radix sort.
@@ -171,7 +315,7 @@ class ParallelRadixSort:
         self.sharding_spec = sharding_spec
         self.bits_per_pass = bits_per_pass
         self.num_buckets = 2 ** bits_per_pass
-        
+
     def _compute_local_histogram(self, keys: Array, digit_pos: int) -> Array:
         """
         Compute histogram of digits for local shard of data.
@@ -192,13 +336,13 @@ class ParallelRadixSort:
         shift = digit_pos * self.bits_per_pass
         mask = (1 << self.bits_per_pass) - 1
         digits = (keys >> shift) & mask
-        
+
         # Use bincount for vectorized histogram computation
         # This is much faster than the previous loop-based approach
         histogram = jnp.bincount(digits, length=self.num_buckets).astype(jnp.int32)
-            
+
         return histogram
-    
+
     def _compute_global_offsets(self, global_histogram: Array) -> Array:
         """
         Compute global offsets using prefix sum (exclusive scan).
@@ -214,18 +358,18 @@ class ParallelRadixSort:
             Starting offset for each bucket in the global sorted array
         """
         # Exclusive scan to get starting positions
-        offsets = jnp.concatenate([jnp.zeros(1, dtype=jnp.int32), 
+        offsets = jnp.concatenate([jnp.zeros(1, dtype=jnp.int32),
                                   jnp.cumsum(global_histogram[:-1])])
         return offsets
-    
+
     def _redistribute_data(
-        self, 
-        keys: Array, 
-        values: Optional[Array],
+        self,
+        keys: Array,
+        values: Array | None,
         digit_pos: int,
         global_offsets: Array,
         local_offsets: Array
-    ) -> Tuple[Array, Optional[Array]]:
+    ) -> tuple[Array, Array | None]:
         """
         Redistribute data across devices based on digit values.
         
@@ -251,23 +395,23 @@ class ParallelRadixSort:
         shift = digit_pos * self.bits_per_pass
         mask = (1 << self.bits_per_pass) - 1
         digits = (keys >> shift) & mask
-        
+
         # Calculate destination indices
         dest_indices = global_offsets[digits] + local_offsets[digits]
-        
+
         # Sort by destination indices to prepare for all_to_all
         sort_indices = jnp.argsort(dest_indices)
         sorted_keys = keys[sort_indices]
         sorted_values = values[sort_indices] if values is not None else None
-        
+
         # Use all_to_all collective for redistribution
         # This is where the actual cross-device communication happens
         if self.sharding_spec.mesh.size > 1:
             # Prepare for all_to_all by determining send counts
-            device_boundaries = jnp.linspace(0, keys.shape[0], 
+            device_boundaries = jnp.linspace(0, keys.shape[0],
                                            self.sharding_spec.mesh.size + 1,
                                            dtype=jnp.int32)
-            
+
             # Simplified redistribution - in production, would use actual all_to_all
             # For now, returning sorted data as placeholder
             redistributed_keys = sorted_keys
@@ -276,15 +420,15 @@ class ParallelRadixSort:
             # Single device case - no redistribution needed
             redistributed_keys = sorted_keys
             redistributed_values = sorted_values
-            
+
         return redistributed_keys, redistributed_values
-    
+
     def sort_multi_column(
         self,
-        keys: List[Array],
-        values: Optional[Dict[str, Array]] = None,
-        ascending: Union[bool, List[bool]] = True
-    ) -> Tuple[List[Array], Optional[Dict[str, Array]]]:
+        keys: list[Array],
+        values: dict[str, Array] | None = None,
+        ascending: bool | list[bool] = True
+    ) -> tuple[list[Array], dict[str, Array] | None]:
         """
         Sort by multiple columns with individual sort orders.
         
@@ -306,22 +450,22 @@ class ParallelRadixSort:
         """
         # Use the new lexicographic sort function
         indices = multi_column_lexsort(keys, ascending)
-        
+
         # Reorder all keys and values using the sorted indices
         sorted_keys = [key[indices] for key in keys]
-        
+
         sorted_values = None
         if values is not None:
             sorted_values = {col: arr[indices] for col, arr in values.items()}
-        
+
         return sorted_keys, sorted_values
 
     def sort(
-        self, 
-        keys: Array, 
-        values: Optional[Array] = None,
+        self,
+        keys: Array,
+        values: Array | None = None,
         ascending: bool = True
-    ) -> Tuple[Array, Optional[Array]]:
+    ) -> tuple[Array, Array | None]:
         """
         Perform massively parallel radix sort.
         
@@ -342,7 +486,7 @@ class ParallelRadixSort:
         # Store original dtype for later conversion back
         original_dtype = keys.dtype
         sort_keys = keys
-        
+
         # Handle floating point keys by converting to sortable integers
         if keys.dtype in [jnp.float32, jnp.float64]:
             # Convert floats to sortable integer representation
@@ -355,61 +499,61 @@ class ParallelRadixSort:
                 sort_keys = keys.astype(jnp.uint32) ^ jnp.uint32(1 << 31)
             else:
                 sort_keys = keys.astype(jnp.uint64) ^ (jnp.uint64(1) << 63)
-            
+
         # Determine number of passes needed
         key_bits = 64 if sort_keys.dtype in [jnp.int64, jnp.uint64, jnp.float64] else 32
         num_passes = key_bits // self.bits_per_pass
-        
+
         # Process each digit position using scan for sequential operations
         def radix_pass(carry, pass_idx):
             current_keys, current_values = carry
-            
+
             # Skip higher-order zero bytes for efficiency
             should_process = (pass_idx == 0) | (jnp.any(current_keys >> (pass_idx * self.bits_per_pass) != 0))
-            
+
             def process_pass():
                 # Phase 1: Local histogram calculation
                 local_hist = self._compute_local_histogram(current_keys, pass_idx)
-                
+
                 # Phase 2: Global histogram aggregation
                 # Note: psum requires being inside a pmap context
                 # Since scan doesn't support axis_name, we'll use local_hist directly
                 global_hist = local_hist
-                    
+
                 # Phase 3: Compute global offsets
                 global_offsets = self._compute_global_offsets(global_hist)
-                
+
                 # Phase 4: Compute local offsets within each bucket
                 local_offsets = jnp.zeros_like(current_keys, dtype=jnp.int32)
-                
+
                 # Phase 5: Redistribute data
                 return self._redistribute_data(
-                    current_keys, current_values, pass_idx, 
+                    current_keys, current_values, pass_idx,
                     global_offsets, local_offsets
                 )
-            
+
             # Conditionally process or skip this pass
             new_keys, new_values = jax.lax.cond(
                 should_process,
                 lambda: process_pass(),
                 lambda: (current_keys, current_values)
             )
-            
+
             return (new_keys, new_values), None
-        
+
         # Use scan to process all passes sequentially
         (current_keys, current_values), _ = jax.lax.scan(
-            radix_pass, 
-            (sort_keys, values), 
+            radix_pass,
+            (sort_keys, values),
             jnp.arange(num_passes)
         )
-        
+
         # Handle descending order if requested
         if not ascending:
             current_keys = current_keys[::-1]
             if current_values is not None:
                 current_values = current_values[::-1]
-        
+
         # Convert keys back to original dtype
         if original_dtype in [jnp.float32, jnp.float64]:
             # For floats, we need to get the sorted indices and use them to reorder original keys
@@ -433,9 +577,9 @@ class ParallelRadixSort:
             # No conversion needed
             result_keys = current_keys
             result_values = current_values
-                
+
         return result_keys, result_values
-    
+
     def _float_to_sortable_int(self, arr: Array) -> Array:
         """
         Convert floating point array to sortable integer representation.
@@ -451,11 +595,11 @@ class ParallelRadixSort:
             int_view = arr.view(jnp.int64)
             # For float64, use int64 constant to avoid overflow
             sign_bit = jnp.array(0x8000000000000000, dtype=jnp.uint64).view(jnp.int64)
-        
+
         # Flip sign bit and negative numbers to make them sortable
         mask = int_view < 0
         int_view = jnp.where(mask, ~int_view, int_view | sign_bit)
-        
+
         return int_view
 
 
@@ -466,7 +610,7 @@ class SortBasedGroupBy:
     This leverages the parallel radix sort to group data, then uses
     JAX's segmented operations for efficient aggregation.
     """
-    
+
     def __init__(self, sharding_spec: ShardingSpec):
         """
         Initialize sort-based groupby.
@@ -478,13 +622,13 @@ class SortBasedGroupBy:
         """
         self.sharding_spec = sharding_spec
         self.sorter = ParallelRadixSort(sharding_spec)
-        
-    def _apply_aggregation_vectorized(self, sorted_vals: Array, segment_ids: Array, 
+
+    def _apply_aggregation_vectorized(self, sorted_vals: Array, segment_ids: Array,
                                       agg_func: str, num_segments: int) -> Array:
         """Apply aggregation using vectorized operations."""
         if agg_func == 'sum':
             return jax.ops.segment_sum(
-                sorted_vals, segment_ids, 
+                sorted_vals, segment_ids,
                 num_segments=num_segments
             )
         elif agg_func == 'mean':
@@ -514,14 +658,14 @@ class SortBasedGroupBy:
             )
         else:
             raise ValueError(f"Unsupported aggregation function: {agg_func}")
-    
+
     def groupby_aggregate_multi_column(
         self,
-        keys: List[Array],
-        key_names: List[str],
-        values: Dict[str, Array],
-        agg_funcs: Dict[str, str]
-    ) -> Tuple[Dict[str, Array], Dict[str, Array]]:
+        keys: list[Array],
+        key_names: list[str],
+        values: dict[str, Array],
+        agg_funcs: dict[str, str]
+    ) -> tuple[dict[str, Array], dict[str, Array]]:
         """
         Perform groupby aggregation on multiple columns.
         
@@ -543,88 +687,55 @@ class SortBasedGroupBy:
         Tuple[Dict[str, Array], Dict[str, Array]]
             Dictionary of unique key columns and aggregated values
         """
+        if not keys or len(keys[0]) == 0:
+            return (
+                {key_name: key[:0] for key_name, key in zip(key_names, keys, strict=False)},
+                {col_name: arr[:0] for col_name, arr in values.items()},
+            )
+
         # Use lexicographic sort to group rows
         indices = multi_column_lexsort(keys)
-        
+        sorted_keys = [key[indices] for key in keys]
+
         # Now find unique key combinations
         n = len(keys[0])
         is_new_group = jnp.zeros(n, dtype=bool)
         is_new_group = is_new_group.at[0].set(True)
-        
+
         # Check where any key changes from previous row
-        for key in keys:
-            sorted_key = key[indices]
+        for sorted_key in sorted_keys:
             # Compare with previous element
             key_changes = sorted_key[1:] != sorted_key[:-1]
             # Update is_new_group for positions 1 onwards
             is_new_group = is_new_group.at[1:].set(is_new_group[1:] | key_changes)
-        
-        # Get unique key values
-        # In JIT context, use masking approach
-        num_segments = jnp.sum(is_new_group)  # Count of unique groups
+
+        num_segments = int(np.asarray(jnp.sum(is_new_group)))
+        boundary_positions = jnp.nonzero(is_new_group, size=n, fill_value=0)[0]
+        compact_positions = boundary_positions[:num_segments]
+
         unique_keys = {}
-        for i, key_name in enumerate(key_names):
-            sorted_key = keys[i][indices]
-            # Use where to create masked array (NaN for non-unique)
-            unique_keys[key_name] = jnp.where(is_new_group, sorted_key, jnp.nan)
-        
+        for key_name, sorted_key in zip(key_names, sorted_keys, strict=False):
+            unique_keys[key_name] = sorted_key[compact_positions]
+
         # Create segment IDs for aggregation
         segment_ids = jnp.cumsum(is_new_group) - 1
-        
+
         # Apply aggregations
-        # Use fixed-size scatter operations that work in sharded contexts
         aggregated_values = {}
-        n = len(keys[0])  # Use input size as upper bound for output
-        
+
         for col_name, agg_func in agg_funcs.items():
             sorted_vals = values[col_name][indices]
-            
-            # Use fixed size (input size) for scatter operations
-            # This avoids issues with traced/sharded sizes
-            if agg_func == 'sum':
-                # Use scatter_add with fixed size
-                aggregated = jnp.zeros(n).at[segment_ids].add(sorted_vals)
-                
-            elif agg_func == 'mean':
-                # Sum values and counts using scatter
-                sums = jnp.zeros(n).at[segment_ids].add(sorted_vals)
-                counts = jnp.zeros(n).at[segment_ids].add(jnp.ones_like(sorted_vals))
-                aggregated = sums / jnp.maximum(counts, 1)
-                
-            elif agg_func == 'max':
-                # Use scatter_max with fixed size
-                init_val = jnp.full(n, -jnp.inf)
-                aggregated = init_val.at[segment_ids].max(sorted_vals)
-                
-            elif agg_func == 'min':
-                # Use scatter_min with fixed size
-                init_val = jnp.full(n, jnp.inf)
-                aggregated = init_val.at[segment_ids].min(sorted_vals)
-                
-            elif agg_func == 'count':
-                # Count using scatter_add with ones
-                aggregated = jnp.zeros(n).at[segment_ids].add(jnp.ones_like(sorted_vals))
-            else:
-                raise ValueError(f"Unsupported aggregation: {agg_func}")
-            
-            # The aggregated array already has size n (input size)
-            # Mark unused positions with NaN for consistency
-            # Only the first num_segments positions contain valid data
-            mask = jnp.arange(n) < num_segments
-            aggregated = jnp.where(mask, aggregated, jnp.nan)
-            aggregated_values[col_name] = aggregated
-        
-        # For the final result, we need to filter out the NaN values
-        # But in a JIT-compatible way, we return padded arrays
-        # The caller can handle filtering if needed
+            aggregated = _scatter_group_aggregate(sorted_vals, segment_ids, agg_func, n)
+            aggregated_values[col_name] = aggregated[:num_segments]
+
         return unique_keys, aggregated_values
 
     def groupby_aggregate(
         self,
         keys: Array,
-        values: Dict[str, Array],
-        agg_funcs: Dict[str, str]
-    ) -> Tuple[Array, Dict[str, Array]]:
+        values: dict[str, Array],
+        agg_funcs: dict[str, str]
+    ) -> tuple[Array, dict[str, Array]]:
         """
         Perform groupby aggregation using sort-based approach.
         
@@ -643,45 +754,43 @@ class SortBasedGroupBy:
         Tuple[Array, Dict[str, Array]]
             Unique keys and aggregated values for each column
         """
+        if len(keys) == 0:
+            return keys[:0], {col_name: arr[:0] for col_name, arr in values.items()}
+
         # Step 1: Sort entire dataset by group key
         # Carry along row indices to track value positions
         row_indices = jnp.arange(keys.shape[0])
         sorted_keys, sorted_indices = self.sorter.sort(keys, row_indices)
-        
+
         # Step 2: Identify segment boundaries
         # Compare adjacent keys to find group boundaries
         is_boundary = jnp.concatenate([
             jnp.array([True]),
             sorted_keys[1:] != sorted_keys[:-1]
         ])
-        
-        # Get unique keys - use masking for JIT compatibility
-        num_groups = jnp.sum(is_boundary)
-        # Use where to create masked array
-        unique_keys = jnp.where(is_boundary, sorted_keys, jnp.nan)
-        
+
+        num_groups = int(np.asarray(jnp.sum(is_boundary)))
+        boundary_positions = jnp.nonzero(is_boundary, size=len(sorted_keys), fill_value=0)[0]
+        unique_keys = sorted_keys[boundary_positions[:num_groups]]
+
         # Create segment IDs for segmented operations
         segment_ids = jnp.cumsum(is_boundary) - 1
-        
+
         # Step 3: Apply aggregations using JAX segmented operations
         aggregated_values = {}
-        
+
         # Use vmap to apply aggregations to multiple columns in parallel if beneficial
         if len(agg_funcs) > 1:
             # Process each column using vectorized operations
             for col_name, agg_func in agg_funcs.items():
                 # Reorder values according to sort
                 sorted_vals = values[col_name][sorted_indices]
-                
+
                 # Apply aggregation using helper method
                 aggregated = self._apply_aggregation_vectorized(
                     sorted_vals, segment_ids, agg_func, num_groups
                 )
-                # Extend to full size with NaN padding
-                full_size = len(sorted_keys)
-                padded = jnp.full(full_size, jnp.nan)
-                padded = padded.at[:num_groups].set(aggregated)
-                aggregated_values[col_name] = padded
+                aggregated_values[col_name] = aggregated
         else:
             # Single column - process directly
             for col_name, agg_func in agg_funcs.items():
@@ -689,12 +798,8 @@ class SortBasedGroupBy:
                 aggregated = self._apply_aggregation_vectorized(
                     sorted_vals, segment_ids, agg_func, num_groups
                 )
-                # Extend to full size with NaN padding
-                full_size = len(sorted_keys)
-                padded = jnp.full(full_size, jnp.nan)
-                padded = padded.at[:num_groups].set(aggregated)
-                aggregated_values[col_name] = padded
-            
+                aggregated_values[col_name] = aggregated
+
         return unique_keys, aggregated_values
 
 
@@ -705,7 +810,7 @@ class ParallelSortMergeJoin:
     Uses parallel radix sort on both tables followed by an efficient
     local merge on each device.
     """
-    
+
     def __init__(self, sharding_spec: ShardingSpec):
         """
         Initialize parallel sort-merge join.
@@ -717,17 +822,21 @@ class ParallelSortMergeJoin:
         """
         self.sharding_spec = sharding_spec
         self.sorter = ParallelRadixSort(sharding_spec)
-        
+
     def join_multi_column(
         self,
-        left_keys: List[Array],
-        left_key_names: List[str],
-        left_values: Dict[str, Array],
-        right_keys: List[Array],
-        right_key_names: List[str],
-        right_values: Dict[str, Array],
-        how: str = 'inner'
-    ) -> Tuple[Dict[str, Array], Dict[str, Array]]:
+        left_keys: list[Array],
+        left_key_names: list[str],
+        left_values: dict[str, Array],
+        right_keys: list[Array],
+        right_key_names: list[str],
+        right_values: dict[str, Array],
+        how: str = 'inner',
+        left_key_dtypes: dict[str, str] | None = None,
+        right_key_dtypes: dict[str, str] | None = None,
+        left_value_dtypes: dict[str, str] | None = None,
+        right_value_dtypes: dict[str, str] | None = None,
+    ) -> tuple[dict[str, Array], dict[str, Array]]:
         """
         Perform a vectorized multi-column join using broadcasting.
         
@@ -758,166 +867,82 @@ class ParallelSortMergeJoin:
         """
         n_left = len(left_keys[0])
         n_right = len(right_keys[0])
-        
+
         # Create match matrix using broadcasting
         # Start with all True, then AND with each key comparison
         matches = jnp.ones((n_left, n_right), dtype=bool)
-        
-        for l_key, r_key in zip(left_keys, right_keys):
+
+        for l_key, r_key in zip(left_keys, right_keys, strict=False):
             # Check each key pair using broadcasting
             key_matches = l_key[:, None] == r_key[None, :]
             matches = matches & key_matches
-        
+
+        left_idx_inner, right_idx_inner = jnp.where(matches)
+        left_has_match = jnp.any(matches, axis=1)
+        right_has_match = jnp.any(matches, axis=0)
+        left_unmatched = jnp.where(~left_has_match)[0]
+        right_unmatched = jnp.where(~right_has_match)[0]
+
         if how == 'inner':
-            # Get indices of matches
-            left_idx, right_idx = jnp.where(matches)
-            
-            # Extract matched keys (use left keys for consistency)
-            joined_keys = {}
-            for i, key_name in enumerate(left_key_names):
-                joined_keys[key_name] = left_keys[i][left_idx]
-            
-            # Extract values
-            joined_values = {}
-            for name, arr in left_values.items():
-                joined_values[f'left_{name}'] = arr[left_idx]
-            for name, arr in right_values.items():
-                joined_values[f'right_{name}'] = arr[right_idx]
-                
+            all_left_idx = left_idx_inner
+            all_right_idx = right_idx_inner
         elif how == 'left':
-            # Keep all left rows
-            # For each left row, find if there's a match
-            has_match = jnp.any(matches, axis=1)
-            
-            # For matched rows, get the right indices
-            # For unmatched, use -1 as placeholder
-            result_size = n_left
-            left_idx = jnp.arange(n_left)
-            
-            # Get first matching right index for each left row
-            right_idx = jnp.where(
-                has_match,
-                jnp.argmax(matches, axis=1),  # First match
-                -1  # No match
-            )
-            
-            # Extract keys
-            joined_keys = {}
-            for i, key_name in enumerate(left_key_names):
-                joined_keys[key_name] = left_keys[i]
-            
-            # Extract values
-            joined_values = {}
-            for name, arr in left_values.items():
-                joined_values[f'left_{name}'] = arr
-            
-            # For right values, use NaN for non-matches
-            for name, arr in right_values.items():
-                valid_mask = right_idx >= 0
-                result = jnp.where(
-                    valid_mask,
-                    arr[jnp.maximum(right_idx, 0)],  # Use 0 for -1 to avoid index error
-                    jnp.nan
-                )
-                joined_values[f'right_{name}'] = result
-                
-        elif how == 'right':
-            # Similar to left but swap roles
-            has_match = jnp.any(matches, axis=0)
-            right_idx = jnp.arange(n_right)
-            left_idx = jnp.where(
-                has_match,
-                jnp.argmax(matches, axis=0),
-                -1
-            )
-            
-            joined_keys = {}
-            for i, key_name in enumerate(right_key_names):
-                joined_keys[key_name] = right_keys[i]
-            
-            joined_values = {}
-            for name, arr in right_values.items():
-                joined_values[f'right_{name}'] = arr
-                
-            for name, arr in left_values.items():
-                valid_mask = left_idx >= 0
-                result = jnp.where(
-                    valid_mask,
-                    arr[jnp.maximum(left_idx, 0)],
-                    jnp.nan
-                )
-                joined_values[f'left_{name}'] = result
-                
-        else:  # outer
-            # Combine inner join with unmatched from both sides
-            # First get inner join results
-            left_idx_inner, right_idx_inner = jnp.where(matches)
-            
-            # Find unmatched left rows
-            left_has_match = jnp.any(matches, axis=1)
-            left_unmatched = jnp.where(~left_has_match)[0]
-            
-            # Find unmatched right rows
-            right_has_match = jnp.any(matches, axis=0)
-            right_unmatched = jnp.where(~right_has_match)[0]
-            
-            # Combine all indices
-            # Inner matches + left unmatched + right unmatched
             all_left_idx = jnp.concatenate([
                 left_idx_inner,
                 left_unmatched,
-                jnp.full(len(right_unmatched), -1)
             ])
             all_right_idx = jnp.concatenate([
                 right_idx_inner,
-                jnp.full(len(left_unmatched), -1),
-                right_unmatched
+                jnp.full(left_unmatched.shape[0], -1, dtype=jnp.int32),
             ])
-            
-            # Extract keys (use left keys where available, right otherwise)
-            joined_keys = {}
-            for i, key_name in enumerate(left_key_names):
-                left_part = jnp.where(
-                    all_left_idx >= 0,
-                    left_keys[i][jnp.maximum(all_left_idx, 0)],
-                    jnp.nan
-                )
-                right_part = jnp.where(
-                    (all_left_idx < 0) & (all_right_idx >= 0),
-                    right_keys[i][jnp.maximum(all_right_idx, 0)],
-                    jnp.nan
-                )
-                joined_keys[key_name] = jnp.where(
-                    all_left_idx >= 0,
-                    left_part,
-                    right_part
-                )
-            
-            # Extract values with NaN for missing
-            joined_values = {}
-            for name, arr in left_values.items():
-                joined_values[f'left_{name}'] = jnp.where(
-                    all_left_idx >= 0,
-                    arr[jnp.maximum(all_left_idx, 0)],
-                    jnp.nan
-                )
-            for name, arr in right_values.items():
-                joined_values[f'right_{name}'] = jnp.where(
-                    all_right_idx >= 0,
-                    arr[jnp.maximum(all_right_idx, 0)],
-                    jnp.nan
-                )
-        
+        elif how == 'right':
+            all_left_idx = jnp.concatenate([
+                left_idx_inner,
+                jnp.full(right_unmatched.shape[0], -1, dtype=jnp.int32),
+            ])
+            all_right_idx = jnp.concatenate([
+                right_idx_inner,
+                right_unmatched,
+            ])
+        else:
+            all_left_idx = jnp.concatenate([
+                left_idx_inner,
+                left_unmatched,
+                jnp.full(right_unmatched.shape[0], -1, dtype=jnp.int32),
+            ])
+            all_right_idx = jnp.concatenate([
+                right_idx_inner,
+                jnp.full(left_unmatched.shape[0], -1, dtype=jnp.int32),
+                right_unmatched,
+            ])
+
+        joined_keys = {}
+        for i, key_name in enumerate(left_key_names):
+            joined_keys[key_name] = _coalesce_join_key(
+                left_keys[i],
+                right_keys[i],
+                all_left_idx,
+                all_right_idx,
+            )
+
+        joined_values = {}
+        for name, arr in left_values.items():
+            dtype_name = left_value_dtypes.get(name, str(arr.dtype)) if left_value_dtypes else str(arr.dtype)
+            joined_values[f'left_{name}'] = _gather_join_column(arr, all_left_idx, dtype_name)
+        for name, arr in right_values.items():
+            dtype_name = right_value_dtypes.get(name, str(arr.dtype)) if right_value_dtypes else str(arr.dtype)
+            joined_values[f'right_{name}'] = _gather_join_column(arr, all_right_idx, dtype_name)
+
         return joined_keys, joined_values
 
     def join(
         self,
         left_keys: Array,
-        left_values: Dict[str, Array],
+        left_values: dict[str, Array],
         right_keys: Array,
-        right_values: Dict[str, Array],
+        right_values: dict[str, Array],
         how: str = 'inner'
-    ) -> Tuple[Array, Dict[str, Array]]:
+    ) -> tuple[Array, dict[str, Array]]:
         """
         Perform a parallel sort-merge join.
         
@@ -942,19 +967,19 @@ class ParallelSortMergeJoin:
         # Step 1: Sort both tables by join key
         left_indices = jnp.arange(left_keys.shape[0])
         right_indices = jnp.arange(right_keys.shape[0])
-        
+
         sorted_left_keys, sorted_left_indices = self.sorter.sort(left_keys, left_indices)
         sorted_right_keys, sorted_right_indices = self.sorter.sort(right_keys, right_indices)
-        
+
         # Step 2: Partition alignment (simplified for now)
         # In production, would redistribute data so matching keys are on same device
-        
+
         # Step 3: Local merge
         # This is a simplified merge for inner join
         merged_keys = []
         merged_left_indices = []
         merged_right_indices = []
-        
+
         # Vectorized merge algorithm using JAX operations with vmap
         def merge_sorted_arrays():
             # For inner join, find matching keys using broadcasting
@@ -963,27 +988,27 @@ class ParallelSortMergeJoin:
                 # Create masks for matching keys
                 matches = sorted_left_keys[:, None] == sorted_right_keys[None, :]
                 left_match_idx, right_match_idx = jnp.where(matches)
-                
+
                 merged_keys = sorted_left_keys[left_match_idx]
                 merged_left_indices = sorted_left_indices[left_match_idx]
                 merged_right_indices = sorted_right_indices[right_match_idx]
-                
+
             else:
                 # For outer joins, use a hybrid approach
                 # Find all unique keys first
                 all_keys = jnp.concatenate([sorted_left_keys, sorted_right_keys])
                 unique_keys = jnp.unique(all_keys)
-                
+
                 # Use searchsorted to find positions
                 left_positions = jnp.searchsorted(sorted_left_keys, unique_keys)
                 right_positions = jnp.searchsorted(sorted_right_keys, unique_keys)
-                
+
                 # Check which keys exist in each table
                 left_exists = (left_positions < len(sorted_left_keys)) & \
                              (sorted_left_keys[jnp.minimum(left_positions, len(sorted_left_keys)-1)] == unique_keys)
                 right_exists = (right_positions < len(sorted_right_keys)) & \
                               (sorted_right_keys[jnp.minimum(right_positions, len(sorted_right_keys)-1)] == unique_keys)
-                
+
                 # Build result based on join type
                 if how == 'left':
                     # Use left keys and match with right where possible
@@ -993,7 +1018,7 @@ class ParallelSortMergeJoin:
                     right_match_idx = jnp.searchsorted(sorted_right_keys, sorted_left_keys)
                     valid_matches = (right_match_idx < len(sorted_right_keys)) & \
                                    (sorted_right_keys[jnp.minimum(right_match_idx, len(sorted_right_keys)-1)] == sorted_left_keys)
-                    merged_right_indices = jnp.where(valid_matches, 
+                    merged_right_indices = jnp.where(valid_matches,
                                                      sorted_right_indices[right_match_idx],
                                                      -1)
                 elif how == 'right':
@@ -1011,7 +1036,7 @@ class ParallelSortMergeJoin:
                     # Include all keys from both tables
                     # This is simplified - production would handle duplicates properly
                     merged_keys = unique_keys
-                    
+
                     # Map indices
                     merged_left_indices = jnp.where(left_exists,
                                                     sorted_left_indices[jnp.minimum(left_positions, len(sorted_left_indices)-1)],
@@ -1019,14 +1044,14 @@ class ParallelSortMergeJoin:
                     merged_right_indices = jnp.where(right_exists,
                                                      sorted_right_indices[jnp.minimum(right_positions, len(sorted_right_indices)-1)],
                                                      -1)
-            
+
             return merged_keys, merged_left_indices, merged_right_indices
-        
+
         merged_keys, merged_left_indices, merged_right_indices = merge_sorted_arrays()
-        
+
         # Step 4: Gather values using merged indices
         result_values = {}
-        
+
         # Add left table values
         for col_name, col_values in left_values.items():
             valid_mask = merged_left_indices >= 0
@@ -1036,7 +1061,7 @@ class ParallelSortMergeJoin:
                 jnp.nan  # Or appropriate NULL value
             )
             result_values[f"left_{col_name}"] = result_col
-            
+
         # Add right table values
         for col_name, col_values in right_values.items():
             valid_mask = merged_right_indices >= 0
@@ -1046,17 +1071,17 @@ class ParallelSortMergeJoin:
                 jnp.nan  # Or appropriate NULL value
             )
             result_values[f"right_{col_name}"] = result_col
-            
+
         return merged_keys, result_values
 
 
 # Public API functions
 def parallel_sort(
     arr: Array,
-    sharding_spec: Optional[ShardingSpec] = None,
-    values: Optional[Array] = None,
+    sharding_spec: ShardingSpec | None = None,
+    values: Array | None = None,
     ascending: bool = True
-) -> Union[Array, Tuple[Array, Array]]:
+) -> Array | tuple[Array, Array]:
     """
     Sort an array using massively parallel radix sort.
     
@@ -1077,14 +1102,13 @@ def parallel_sort(
         Sorted array, or tuple of (sorted_keys, reordered_values) if values provided
     """
     if sharding_spec is None:
-        # Create default single-device sharding
-        from .sharding import ShardingSpec
-        mesh = Mesh(jax.devices()[:1], axis_names=('devices',))
+        from .sharding import ShardingSpec, create_device_mesh
+        mesh = create_device_mesh(devices=jax.devices())
         sharding_spec = ShardingSpec(mesh=mesh, row_sharding=False)
-        
+
     sorter = ParallelRadixSort(sharding_spec)
     sorted_keys, sorted_values = sorter.sort(arr, values, ascending)
-    
+
     if values is None:
         return sorted_keys
     return sorted_keys, sorted_values
@@ -1092,10 +1116,10 @@ def parallel_sort(
 
 def groupby_aggregate(
     keys: Array,
-    values: Dict[str, Array],
-    agg_funcs: Dict[str, str],
-    sharding_spec: Optional[ShardingSpec] = None
-) -> Tuple[Array, Dict[str, Array]]:
+    values: dict[str, Array],
+    agg_funcs: dict[str, str],
+    sharding_spec: ShardingSpec | None = None
+) -> tuple[Array, dict[str, Array]]:
     """
     Perform groupby aggregation using sort-based approach.
     
@@ -1116,73 +1140,43 @@ def groupby_aggregate(
         Unique keys and aggregated values
     """
     if sharding_spec is None:
-        from .sharding import ShardingSpec
-        mesh = Mesh(jax.devices()[:1], axis_names=('devices',))
+        from .sharding import ShardingSpec, create_device_mesh
+        mesh = create_device_mesh(devices=jax.devices())
         sharding_spec = ShardingSpec(mesh=mesh, row_sharding=False)
-        
+
     groupby = SortBasedGroupBy(sharding_spec)
-    unique_keys, aggregated = groupby.groupby_aggregate(keys, values, agg_funcs)
-    
-    # Clean up padding for user-facing API
-    # The unique_keys have NaN where not unique, aggregated values are padded at the end
-    valid_mask = ~jnp.isnan(unique_keys)
-    unique_keys = unique_keys[valid_mask]
-    
-    # For aggregated values, they are compact at the beginning
-    # Count how many valid unique keys we have
-    num_valid = jnp.sum(valid_mask)
-    aggregated = {col: vals[:num_valid] for col, vals in aggregated.items()}
-    
-    return unique_keys, aggregated
+    return groupby.groupby_aggregate(keys, values, agg_funcs)
 
 
 def groupby_aggregate_multi_column(
-    keys: List[Array],
-    key_names: List[str],
-    values: Dict[str, Array],
-    agg_funcs: Dict[str, str],
-    sharding_spec: Optional[ShardingSpec] = None
-) -> Tuple[Dict[str, Array], Dict[str, Array]]:
+    keys: list[Array],
+    key_names: list[str],
+    values: dict[str, Array],
+    agg_funcs: dict[str, str],
+    sharding_spec: ShardingSpec | None = None
+) -> tuple[dict[str, Array], dict[str, Array]]:
     """
     Perform multi-column groupby aggregation with cleanup.
     
     This is a wrapper that handles padding cleanup for user-facing API.
     """
     if sharding_spec is None:
-        from .sharding import ShardingSpec
-        mesh = Mesh(jax.devices()[:1], axis_names=('devices',))
+        from .sharding import ShardingSpec, create_device_mesh
+        mesh = create_device_mesh(devices=jax.devices())
         sharding_spec = ShardingSpec(mesh=mesh, row_sharding=False)
-        
+
     groupby = SortBasedGroupBy(sharding_spec)
-    unique_key_dict, aggregated = groupby.groupby_aggregate_multi_column(
-        keys, key_names, values, agg_funcs
-    )
-    
-    # Clean up NaN padding from multi-column results
-    # Use the first key to determine valid rows
-    first_key = unique_key_dict[key_names[0]]
-    valid_mask = ~jnp.isnan(first_key)
-    num_valid = jnp.sum(valid_mask)
-    
-    # Filter unique keys
-    cleaned_keys = {}
-    for key_name, key_vals in unique_key_dict.items():
-        cleaned_keys[key_name] = key_vals[valid_mask]
-    
-    # Aggregated values are compact at the beginning
-    cleaned_agg = {col: vals[:num_valid] for col, vals in aggregated.items()}
-    
-    return cleaned_keys, cleaned_agg
+    return groupby.groupby_aggregate_multi_column(keys, key_names, values, agg_funcs)
 
 
 def sort_merge_join(
     left_keys: Array,
-    left_values: Dict[str, Array],
+    left_values: dict[str, Array],
     right_keys: Array,
-    right_values: Dict[str, Array],
+    right_values: dict[str, Array],
     how: str = 'inner',
-    sharding_spec: Optional[ShardingSpec] = None
-) -> Tuple[Array, Dict[str, Array]]:
+    sharding_spec: ShardingSpec | None = None
+) -> tuple[Array, dict[str, Array]]:
     """
     Perform a parallel sort-merge join.
     
@@ -1207,9 +1201,78 @@ def sort_merge_join(
         Joined keys and combined values
     """
     if sharding_spec is None:
-        from .sharding import ShardingSpec
-        mesh = Mesh(jax.devices()[:1], axis_names=('devices',))
+        from .sharding import ShardingSpec, create_device_mesh
+        mesh = create_device_mesh(devices=jax.devices())
         sharding_spec = ShardingSpec(mesh=mesh, row_sharding=False)
-        
+
     joiner = ParallelSortMergeJoin(sharding_spec)
     return joiner.join(left_keys, left_values, right_keys, right_values, how)
+
+
+def _scatter_group_aggregate(sorted_vals: Array, segment_ids: Array, agg_func: str, output_size: int) -> Array:
+    """Aggregate values into a fixed-size scatter buffer."""
+    if agg_func == 'sum':
+        return jnp.zeros(output_size, dtype=sorted_vals.dtype).at[segment_ids].add(sorted_vals)
+    if agg_func == 'mean':
+        sums = jnp.zeros(output_size, dtype=sorted_vals.dtype).at[segment_ids].add(sorted_vals)
+        counts = jnp.zeros(output_size, dtype=jnp.float32).at[segment_ids].add(1.0)
+        return sums / jnp.maximum(counts, 1.0)
+    if agg_func == 'count':
+        return jnp.zeros(output_size, dtype=jnp.int32).at[segment_ids].add(1)
+    if agg_func == 'max':
+        init_val = _extreme_fill_value(sorted_vals, is_min=False, output_size=output_size)
+        return init_val.at[segment_ids].max(sorted_vals)
+    if agg_func == 'min':
+        init_val = _extreme_fill_value(sorted_vals, is_min=True, output_size=output_size)
+        return init_val.at[segment_ids].min(sorted_vals)
+    raise ValueError(f"Unsupported aggregation: {agg_func}")
+
+
+def _extreme_fill_value(values: Array, is_min: bool, output_size: int) -> Array:
+    """Create the initial scatter buffer for min/max reductions."""
+    if jnp.issubdtype(values.dtype, jnp.floating):
+        fill_value = jnp.inf if is_min else -jnp.inf
+    elif jnp.issubdtype(values.dtype, jnp.integer):
+        info = jnp.iinfo(values.dtype)
+        fill_value = info.max if is_min else info.min
+    elif values.dtype == jnp.bool_:
+        fill_value = True if is_min else False
+    else:
+        fill_value = 0
+    return jnp.full(output_size, fill_value, dtype=values.dtype)
+
+
+def _coalesce_join_key(left_key: Array, right_key: Array, left_idx: Array, right_idx: Array) -> Array:
+    """Choose the left key when present, otherwise the right key."""
+    if left_idx.shape[0] == 0:
+        return left_key[:0]
+    safe_left = jnp.maximum(left_idx, 0)
+    safe_right = jnp.maximum(right_idx, 0)
+    return jnp.where(left_idx >= 0, left_key[safe_left], right_key[safe_right])
+
+
+def _gather_join_column(arr: Array, indices: Array, dtype_name: str) -> Array:
+    """Gather a payload column for join output, preserving string semantics."""
+    if indices.shape[0] == 0:
+        return arr[:0]
+
+    safe_indices = jnp.maximum(indices, 0)
+    valid_mask = indices >= 0
+
+    if dtype_name == 'string':
+        gathered = arr[safe_indices]
+        return jnp.where(valid_mask, gathered, jnp.full(gathered.shape, -1, dtype=gathered.dtype))
+
+    if jnp.all(valid_mask):
+        return arr[safe_indices]
+
+    gathered = arr[safe_indices]
+    if jnp.issubdtype(gathered.dtype, jnp.integer) or jnp.issubdtype(gathered.dtype, jnp.bool_):
+        gathered = gathered.astype(jnp.float32)
+        fill_value = jnp.nan
+    elif jnp.issubdtype(gathered.dtype, jnp.complexfloating):
+        fill_value = jnp.asarray(jnp.nan + 0j, dtype=gathered.dtype)
+    else:
+        fill_value = jnp.asarray(jnp.nan, dtype=gathered.dtype)
+
+    return jnp.where(valid_mask, gathered, fill_value)
